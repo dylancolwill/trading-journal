@@ -46,6 +46,37 @@ function guessTick(ticks) {
 // >= this many times the opposing volume one tick across the diagonal.
 const IMBALANCE_RATIO = 2;
 
+// Per-tick bid × ask breakdown of one bar, windowed ±10 ticks around the reference price(s),
+// with diagonal-imbalance and POC flags. `refs` = [{ price, tag }] to mark entry/exit rows.
+function footprintBlock(bar, tick, refs, title) {
+  if (!bar || !bar.levels) return '';
+  const ks = Object.keys(bar.levels).map(Number);
+  const refKs = refs.map(r => Math.round(r.price / tick));
+  if (!ks.length || !refKs.length) return '';
+  const loK = Math.max(Math.min(...ks), Math.min(...refKs) - 10);
+  const hiK = Math.min(Math.max(...ks), Math.max(...refKs) + 10);
+  let pocK = null, pocV = -1;
+  for (const k of ks) { const [bd, ak] = bar.levels[k]; if (bd + ak > pocV) { pocV = bd + ak; pocK = k; } }
+
+  const lines = [];
+  for (let k = hiK; k >= loK; k--) {
+    const cell = bar.levels[k];
+    if (!cell) continue;
+    const [bid, ask] = cell;
+    const bidBelow = (bar.levels[k - 1] || [0, 0])[0];
+    const askAbove = (bar.levels[k + 1] || [0, 0])[1];
+    const flags = [
+      ask > 0 && ask >= IMBALANCE_RATIO * Math.max(bidBelow, 1) ? '>ask' : '',
+      bid > 0 && bid >= IMBALANCE_RATIO * Math.max(askAbove, 1) ? '<bid' : '',
+      k === pocK ? 'POC' : '',
+      ...refs.filter(r => Math.round(r.price / tick) === k).map(r => r.tag),
+    ].filter(Boolean).join(' ');
+    lines.push(`${fmtPx(k * tick).padStart(8)}  ${String(bid).padStart(6)} x ${String(ask).padEnd(6)}${flags ? '  ' + flags : ''}`);
+  }
+  if (!lines.length) return '';
+  return `\n\n=== FOOTPRINT DETAIL — ${title} (bid × ask per tick; >ask = buy imbalance, <bid = sell imbalance) ===\n${lines.join('\n')}`;
+}
+
 // META routes must come before /:id to avoid being swallowed by the param
 router.get('/meta/accounts', async (req, res) => {
   try {
@@ -290,33 +321,27 @@ router.post('/:id/analyze', async (req, res) => {
           ? `\n\n=== STACKED DIAGONAL IMBALANCES (BUY = ask ≥${IMBALANCE_RATIO}× bid one tick below; SELL = bid ≥${IMBALANCE_RATIO}× ask one tick above; 3+ stacked levels) ===\n${imbLines.slice(0, 40).join('\n')}`
           : '';
 
-        // Detailed footprint of the entry bar (± up to 10 ticks around entry).
+        // Detailed footprint of the entry and exit bars. On a scalp both fills usually land in
+        // the same 1-min bar, so merge into one block with both markers rather than repeat it.
         let fpSection = '';
         const ePx = Number(trade.entry_price);
-        const eb = bars[Math.floor(entryMs / BAR_MS) * BAR_MS];
-        if (eb && Number.isFinite(ePx)) {
-          const entryK = Math.round(ePx / tick);
-          const ks = Object.keys(eb.levels).map(Number);
-          const loK = Math.max(Math.min(...ks), entryK - 10);
-          const hiK = Math.min(Math.max(...ks), entryK + 10);
-          let pocK = null, pocV = -1;
-          for (const k of ks) { const [bd, ak] = eb.levels[k]; if (bd + ak > pocV) { pocV = bd + ak; pocK = k; } }
-          const fp = [];
-          for (let k = hiK; k >= loK; k--) {
-            const cell = eb.levels[k];
-            if (!cell) continue;
-            const [bid, ask] = cell;
-            const bidBelow = (eb.levels[k - 1] || [0, 0])[0];
-            const askAbove = (eb.levels[k + 1] || [0, 0])[1];
-            const flags = [
-              ask > 0 && ask >= IMBALANCE_RATIO * Math.max(bidBelow, 1) ? '>ask' : '',
-              bid > 0 && bid >= IMBALANCE_RATIO * Math.max(askAbove, 1) ? '<bid' : '',
-              k === pocK ? 'POC' : '',
-              k === entryK ? '←ENTRY' : '',
-            ].filter(Boolean).join(' ');
-            fp.push(`${fmtPx(k * tick).padStart(8)}  ${String(bid).padStart(6)} x ${String(ask).padEnd(6)}${flags ? '  ' + flags : ''}`);
+        const xPx = trade.exit_price != null ? Number(trade.exit_price) : NaN;
+        const entryBarTs = Math.floor(entryMs / BAR_MS) * BAR_MS;
+        const exitBarTs = trade.exit_time ? Math.floor(exitMs / BAR_MS) * BAR_MS : null;
+
+        if (exitBarTs === entryBarTs && Number.isFinite(ePx) && Number.isFinite(xPx)) {
+          fpSection = footprintBlock(bars[entryBarTs], tick,
+            [{ price: ePx, tag: '←ENTRY' }, { price: xPx, tag: '←EXIT' }],
+            `entry + exit bar ${utcHM(entryBarTs)} UTC`);
+        } else {
+          if (Number.isFinite(ePx)) {
+            fpSection += footprintBlock(bars[entryBarTs], tick,
+              [{ price: ePx, tag: '←ENTRY' }], `entry bar ${utcHM(entryBarTs)} UTC`);
           }
-          fpSection = `\n\n=== FOOTPRINT DETAIL — entry bar ${utcHM(eb.ts)} UTC (bid × ask per tick; >ask = buy imbalance, <bid = sell imbalance) ===\n${fp.join('\n')}`;
+          if (exitBarTs != null && Number.isFinite(xPx)) {
+            fpSection += footprintBlock(bars[exitBarTs], tick,
+              [{ price: xPx, tag: '←EXIT' }], `exit bar ${utcHM(exitBarTs)} UTC`);
+          }
         }
 
         tickSection = `\n\n=== ORDERFLOW DATA (1-min bars, UTC) ===\nTotal ticks: ${allTicks.length}\n\n${lines.join('\n')}${imbSection}${fpSection}`;
