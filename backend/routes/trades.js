@@ -487,21 +487,33 @@ SCORE: <number>/10`;
     console.log(`[analyze] SSE headers flushed, spawning claude`);
 
     let fullText = '';
+    let thinkingChars = 0;
     const t0 = Date.now();
-    const THINKING_STAGE = 'Model is reasoning — no output yet (usually 1–3 min)…';
+    const THINKING_STAGE = 'Model is reasoning…';
     res.write(`data: ${JSON.stringify({ stage: THINKING_STAGE, elapsed: 0 })}\n\n`);
 
-    // Progress ticks double as the keep-alive. While the model is still thinking there is
-    // no stdout at all, so without these the UI looks hung for a minute or more.
+    // Progress ticks double as the keep-alive. The reasoning phase produces no answer text,
+    // so surface the thinking volume instead — otherwise the UI looks frozen for minutes.
     const heartbeat = setInterval(() => {
       const elapsed = Math.round((Date.now() - t0) / 1000);
-      const payload = fullText ? { elapsed } : { elapsed, stage: THINKING_STAGE };
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      if (fullText) return res.write(`data: ${JSON.stringify({ elapsed })}\n\n`);
+      const approxTokens = Math.round(thinkingChars / 4);
+      const stage = approxTokens
+        ? `Model is reasoning… ~${approxTokens.toLocaleString()} thinking tokens`
+        : THINKING_STAGE;
+      res.write(`data: ${JSON.stringify({ elapsed, stage })}\n\n`);
     }, 5000);
 
     const claudePath = process.env.CLAUDE_PATH || 'claude';
     console.log(`[analyze] claudePath=${claudePath}`);
-    const child = spawn(claudePath, ['-p', '--no-session-persistence', '--model', 'claude-sonnet-4-6', prompt], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // stream-json + partial messages gives real incremental output. In the default text mode
+    // the CLI buffers the whole answer and prints it at the end, so the UI sat on one status
+    // for minutes and every progress stage fired at once.
+    const child = spawn(claudePath, [
+      '-p', '--no-session-persistence', '--model', 'claude-sonnet-4-6',
+      '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
+      prompt,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
     console.log(`[analyze] claude spawned pid=${child.pid}`);
 
     child.on('error', err => {
@@ -510,14 +522,42 @@ SCORE: <number>/10`;
       res.end();
     });
 
+    // Parse the CLI's NDJSON stream: thinking deltas drive the progress readout, text deltas
+    // are forwarded to the browser as they arrive.
+    let ndjson = '';
+    let writing = false;
     child.stdout.on('data', chunk => {
-      const text = chunk.toString();
-      if (!fullText) {
-        console.log(`[analyze] first output after ${Math.round((Date.now() - t0) / 1000)}s`);
-        res.write(`data: ${JSON.stringify({ stage: 'Writing analysis…' })}\n\n`);
+      ndjson += chunk.toString();
+      const lines = ndjson.split('\n');
+      ndjson = lines.pop();                       // keep the trailing partial line
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+
+        if (ev.type === 'result' && !fullText && typeof ev.result === 'string') {
+          fullText = ev.result;                   // fallback if no deltas were seen
+          res.write(`data: ${JSON.stringify({ text: fullText })}\n\n`);
+          continue;
+        }
+        if (ev.type !== 'stream_event' || !ev.event) continue;
+        const e = ev.event;
+
+        if (e.type === 'content_block_delta' && e.delta) {
+          if (e.delta.type === 'thinking_delta') {
+            thinkingChars += (e.delta.thinking || '').length;
+          } else if (e.delta.type === 'text_delta') {
+            const text = e.delta.text || '';
+            if (!writing) {
+              writing = true;
+              console.log(`[analyze] first text after ${Math.round((Date.now() - t0) / 1000)}s (thinking ~${thinkingChars} chars)`);
+              res.write(`data: ${JSON.stringify({ stage: 'Writing analysis…' })}\n\n`);
+            }
+            fullText += text;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          }
+        }
       }
-      fullText += text;
-      res.write(`data: ${JSON.stringify({ text })}\n\n`);
     });
 
     child.stderr.on('data', data => console.error('[analyze] claude stderr:', data.toString()));

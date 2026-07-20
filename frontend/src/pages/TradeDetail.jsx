@@ -129,9 +129,9 @@ export default function TradeDetail() {
     [/^\s*(?:##\s*|\*\*)?6[.)]/im, 'Reviewing exit timing…'],
     [/^\s*(?:##\s*|\*\*)?5[.)]/im, 'Finding better entries…'],
     [/^\s*(?:##\s*|\*\*)?4[.)]/im, 'Verdict: right or wrong…'],
-    [/^\s*(?:##\s*|\*\*)?3[.)]/im, 'Reviewing entry quality…'],
-    [/^\s*(?:##\s*|\*\*)?2[.)]/im, 'Checking marked levels…'],
-    [/^\s*(?:##\s*|\*\*)?1[.)]/im, 'Analysing market context…'],
+    [/^\s*(?:##\s*|\*\*)?3[.)]/im, 'Initiative vs responsive…'],
+    [/^\s*(?:##\s*|\*\*)?2[.)]/im, 'Assessing location…'],
+    [/^\s*(?:##\s*|\*\*)?1[.)]/im, 'Reading auction context…'],
   ];
 
   const handleGenerateAi = async () => {
