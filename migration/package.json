@@ -1,0 +1,9 @@
+{
+  "name": "trading-journal-migration",
+  "version": "1.0.0",
+  "main": "migrate.js",
+  "dependencies": {
+    "mongodb": "^6.7.0",
+    "pg": "^8.11.3"
+  }
+}

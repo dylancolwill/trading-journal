@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# build output
+frontend/dist/
+
+# environment / secrets
+.env
+*.env
+!.env.example
+
+# uploaded trade screenshots (user data — large, not source)
+images/
+
+# debug artifacts
+backend/last-prompt.txt
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
