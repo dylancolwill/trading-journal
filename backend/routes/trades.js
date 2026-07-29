@@ -460,16 +460,18 @@ Notes: ${trade.description || 'none'}
 ${tickSection}${tpoSection}${levelsSection}
 
 ## Deliver (concise, evidence-first)
-1. **Auction context** — answer Dalton's two questions. Balance or imbalance? Read the TPO letter sequence for value migration and one-timeframe activity, and say what day type was forming by entry. Where did entry sit vs VA / POC / IB, and what did cum delta show into it?
-2. **Location** — was entry at a genuine reference (VA edge, POC, IB extreme, single print, excess tail, or one of the trader's marked levels) with a definable risk point, or mid-value with no reference? Did price actually react there per the orderflow (absorption, rejection, break)?
-3. **Initiative vs responsive** — was this trade responsive or initiative, and was that the right choice for the auction state? Fading initiative/OTF activity is the cardinal error — call it out explicitly if that is what happened.
-4. **Right or wrong** — verdict on the directional read, backed by orderflow + profile + level interaction. If right but mismanaged, say that.
+State each piece of evidence once. A specific fact — a delta value, a price, an imbalance stack, a bar time — is cited in the one section where it is most load-bearing; later sections may refer back to it ("as above", "the same 14:00 stack") but must not re-state it in full. No section restates another section's verdict. Do not repeat the closing summary block in prose. If a section has nothing new to add, keep it to one line.
+
+1. **Auction context** — answer Dalton's two questions. Balance or imbalance? Read the TPO letter sequence for value migration and one-timeframe activity. Where did entry sit vs VA / POC / IB, and what did cum delta show into it?
+2. **Developing day type & open** — from the TPO/IB structure to entry, name the developing day type (normal / normal variation / trend / double-distribution / neutral) and which of Dalton's four opens this was (Open-Drive, Open-Test-Drive, Open-Rejection-Reverse, or Open-Auction). One line on what the evidence shows, then one line on how that context supports or undercuts this trade (and what it implies for a better play). Keep it tight — this is a read, not an essay.
+3. **Location** — was entry at a genuine reference (VA edge, POC, IB extreme, single print, excess tail, or one of the trader's marked levels) with a definable risk point, or mid-value with no reference? Did price actually react there per the orderflow (absorption, rejection, break)?
+4. **Right or wrong (initiative vs responsive)** — verdict on the directional read, backed by orderflow + profile + level interaction. Was the trade responsive or initiative, and was that the right choice for the auction state? Fading initiative/OTF activity is the cardinal error — call it out if that is what happened. If right but mismanaged, say that.
 5. **Better entry** — a higher-probability scalp in the window: cite the bar/time, the reference it sat on, and what confirmed it.
-6. **Exit quality** — judged as a scalp: was there a logical auction target (POC / opposite VA edge / IB extreme), and was the exit at it, short of it, or a panic scratch? Do not penalize a short hold by itself.
-7. **Key lesson** — one specific, actionable lesson, phrased in AMT terms.
+6. **Exit quality** — judged as a scalp: was there a logical auction target (POC / opposite VA edge / IB extreme), and was the exit at it, short of it, or a panic scratch? Do not penalize a short hold by itself, and say so at most once.
+7. **Key lesson** — one specific, actionable lesson, phrased in AMT terms. Do not re-argue the sections above; give the lesson, not a recap.
 8. **Score /10** — location quality, auction read, orderflow confirmation, exit management (9-10 exceptional; 7-8 good, minor flaws; 5-6 adequate w/ issues; 3-4 weak location or against one-timeframe direction; 0-2 fading OTF conviction / no reference / avoidable).
 
-End with exactly this block, nothing after, one sentence per note:
+End with exactly this block, nothing after. It is the skim-summary — one sentence per note, a verdict pointer only, introducing no evidence not already established above:
 
 ---
 ENTRY: <good|ok|poor> | <one sentence>
