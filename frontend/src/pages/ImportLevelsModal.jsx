@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getLevelsForDate, saveLevels, deleteLevels } from '../api';
+import { getLevelsForDate, saveLevels, deleteLevels, getLevelsExport, levelsExportUrl } from '../api';
 
 const PLACEHOLDER = `=== NQ 09-26  —  2026-07-18 14:22 ===
 (4 objects)
@@ -16,11 +16,23 @@ function fmtDate(str) {
 
 const KIND_COLOR = { line: '#a1a1aa', ray: '#a1a1aa', zone: '#60a5fa', trend: '#facc15' };
 
+// Sentinel instrument for "every instrument saved this day".
+const ALL = '*';
+
+const smallBtn = {
+  background: 'transparent', border: '1px solid #3f3f46', borderRadius: 6,
+  color: '#a1a1aa', padding: '2px 8px', cursor: 'pointer', fontSize: 11,
+};
+
 export default function ImportLevelsModal({ date, onClose }) {
   const [rows, setRows] = useState([]);
   const [raw, setRaw] = useState('');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState('');
+  const [warn, setWarn] = useState(null);
+  const [copied, setCopied] = useState(null);
+
+  const day = String(date || '').slice(0, 10);
 
   const load = () => getLevelsForDate(date).then(setRows).catch(() => setRows([]));
   useEffect(() => { load(); }, [date]);
@@ -32,13 +44,26 @@ export default function ImportLevelsModal({ date, onClose }) {
   }, [onClose]);
 
   const save = async () => {
-    setSaving(true); setErr('');
+    setSaving(true); setErr(''); setWarn(null);
     try {
-      await saveLevels(raw, date);
+      const res = await saveLevels(raw, day);
+      // Lines the parser couldn't read are called out — a silently shrinking import is worse
+      // than a loud one.
+      if (res && res.skipped_count) setWarn(res);
       setRaw('');
       await load();
     } catch (e) { setErr(e.message || 'Save failed'); }
     finally { setSaving(false); }
+  };
+
+  // Levels back out in the same format we read, ready to paste into a NinjaTrader importer.
+  const copy = async (instrument) => {
+    setErr('');
+    try {
+      await navigator.clipboard.writeText(await getLevelsExport(day, instrument === ALL ? null : instrument, 'txt'));
+      setCopied(instrument);
+      setTimeout(() => setCopied(c => (c === instrument ? null : c)), 1500);
+    } catch (e) { setErr(e.message || 'Copy failed'); }
   };
 
   const remove = async (id) => {
@@ -56,19 +81,41 @@ export default function ImportLevelsModal({ date, onClose }) {
         padding: 24, boxShadow: '0 12px 48px rgba(0,0,0,0.6)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-          <h3 style={{ fontSize: 17, fontWeight: 700 }}>Import levels</h3>
+          <h3 style={{ fontSize: 17, fontWeight: 700 }}>Import levels · {fmtDate(day)} session</h3>
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#71717a', fontSize: 18, cursor: 'pointer' }}>✕</button>
         </div>
-        <div style={{ fontSize: 12, color: '#71717a', marginBottom: 16 }}>{fmtDate(date)} — paste your chart snippet. The instrument is read from the header; levels are saved to <strong style={{ color: '#a1a1aa' }}>this day</strong>.</div>
+        <div style={{ fontSize: 12, color: '#71717a', marginBottom: 16 }}>
+          Paste your chart snippet. The instrument is read from the header; levels are saved to the{' '}
+          <strong style={{ color: '#a1a1aa' }}>{fmtDate(day)} New York session</strong> — the session you traded, not the
+          calendar day you exported on. Micro contracts share their parent's levels, so an ES set covers MES trades.
+        </div>
 
         {rows.length > 0 && (
           <div style={{ marginBottom: 18 }}>
-            <div style={{ fontSize: 11, color: '#71717a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Saved for this day</div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <span style={{ fontSize: 11, color: '#71717a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>Saved for this day</span>
+              {rows.length > 1 && (
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={() => copy(ALL)} style={{ ...smallBtn, ...(copied === ALL ? { color: '#22c55e', borderColor: '#22c55e' } : {}) }}>
+                    {copied === ALL ? 'Copied' : 'Copy all'}
+                  </button>
+                  <a href={levelsExportUrl(day, null, 'csv')} download style={{ ...smallBtn, textDecoration: 'none' }}>CSV all</a>
+                </div>
+              )}
+            </div>
             {rows.map(r => (
               <div key={r.id} style={{ background: '#09090b', border: '1px solid #27272a', borderRadius: 8, padding: '10px 12px', marginBottom: 8 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
                   <span style={{ fontWeight: 700, fontSize: 14 }}>{r.instrument} <span style={{ color: '#52525b', fontWeight: 400, fontSize: 12 }}>· {(r.levels || []).length} objects</span></span>
-                  <button onClick={() => remove(r.id)} style={{ background: 'transparent', border: '1px solid #7f1d1d', borderRadius: 6, color: '#f87171', padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>Delete</button>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button onClick={() => copy(r.instrument)} title="Copy as text (same format this page imports)"
+                      style={{ ...smallBtn, ...(copied === r.instrument ? { color: '#22c55e', borderColor: '#22c55e' } : {}) }}>
+                      {copied === r.instrument ? 'Copied' : 'Copy'}
+                    </button>
+                    <a href={levelsExportUrl(day, r.instrument, 'csv')} download title="Download as CSV for a NinjaTrader importer"
+                      style={{ ...smallBtn, textDecoration: 'none' }}>CSV</a>
+                    <button onClick={() => remove(r.id)} style={{ ...smallBtn, borderColor: '#7f1d1d', color: '#f87171' }}>Delete</button>
+                  </div>
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
                   {(r.levels || []).map((o, i) => (
@@ -99,6 +146,14 @@ export default function ImportLevelsModal({ date, onClose }) {
           }}
         />
         {err && <div style={{ color: '#f87171', fontSize: 12, marginTop: 8 }}>{err}</div>}
+        {warn && (
+          <div style={{ background: '#f59e0b12', border: '1px solid #f59e0b55', borderRadius: 6, padding: '8px 10px', marginTop: 8 }}>
+            <div style={{ color: '#f59e0b', fontSize: 12, fontWeight: 600 }}>{warn.skipped_count} line{warn.skipped_count !== 1 ? 's' : ''} could not be read and {warn.skipped_count !== 1 ? 'were' : 'was'} not imported</div>
+            {(warn.skipped || []).map((l, i) => (
+              <div key={i} style={{ color: '#a1a1aa', fontSize: 11, fontFamily: 'monospace', marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{l}</div>
+            ))}
+          </div>
+        )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 14 }}>
           <button onClick={onClose} style={{ background: 'transparent', border: '1px solid #3f3f46', borderRadius: 6, color: '#a1a1aa', padding: '8px 16px', cursor: 'pointer', fontSize: 13 }}>Close</button>
           <button onClick={save} disabled={saving || !raw.trim()} style={{

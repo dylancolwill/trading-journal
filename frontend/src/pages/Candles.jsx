@@ -152,9 +152,11 @@ function CandleChart({ data, levels = [] }) {
     if (o.kind === 'zone') {
       const yTop = y(o.high), yBot = y(o.low);
       const xL = o.ts ? xOf(o.ts) : padL;
+      // An extended rectangle runs to the right edge; a plain one stops at its end anchor.
+      const xR = o.ts2 && !/extend/i.test(o.type || '') ? Math.max(xOf(o.ts2), xL + 1) : W - padR;
       return (
         <g key={i}>
-          <rect x={xL} y={Math.min(yTop, yBot)} width={(W - padR) - xL} height={Math.max(1, Math.abs(yBot - yTop))}
+          <rect x={xL} y={Math.min(yTop, yBot)} width={xR - xL} height={Math.max(1, Math.abs(yBot - yTop))}
             fill={col} fillOpacity="0.22" stroke={col} strokeOpacity="0.9" strokeWidth="1" />
           {o.label && <text x={xL + 4} y={Math.min(yTop, yBot) + 10} fill={col} fontSize="9" fontWeight="700">{o.label}</text>}
         </g>

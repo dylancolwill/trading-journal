@@ -18,6 +18,7 @@
 //     1.16565 test
 //     # ZONES
 //     1.16655-1.16645
+//     15290.00 @ 2026-07-18T08:00:00 -> 15275.00 @ 2026-07-18T09:30:00  (Rectangle, Red, ...)
 //     # TRENDS
 //       7606.75→7552.75 Fixed Range Volume Profile 2
 //
@@ -29,8 +30,11 @@ const NUM = '-?\\d+(?:\\.\\d+)?';
 const LEVEL_RE = new RegExp(`^\\s*(${NUM})(?:\\s+([^()]*?))?\\s*(?:\\(([^)]*)\\))?\\s*$`);
 const ZONE_RE  = new RegExp(`^\\s*(${NUM})\\s*-\\s*(${NUM})(?:\\s+([^()]*?))?\\s*(?:\\(([^)]*)\\))?\\s*$`);
 const ARROW = '(?:→|–>|—>|-+>)';
-// Rich: p1 @ time -> p2 @ time  [label]  (meta)
-const TREND_RICH_RE = new RegExp(`^\\s*(${NUM})\\s*@\\s*(\\d{2}-\\d{2}\\s+\\d{2}:\\d{2})\\s*${ARROW}\\s*(${NUM})\\s*@\\s*(\\d{2}-\\d{2}\\s+\\d{2}:\\d{2})(?:\\s+([^()]*?))?\\s*(?:\\(([^)]*)\\))?\\s*$`);
+// An anchor timestamp: ISO ("2026-09-05T09:31[:00]"), "YYYY-MM-DD HH:MM", or bare "MM-DD HH:MM".
+const TS = '(?:\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}(?::\\d{2})?|\\d{2}-\\d{2}\\s+\\d{2}:\\d{2})';
+// Two-anchor form — "p1 @ time -> p2 @ time  [label]  (meta)". Trendlines use it for their two
+// ends; rectangles use it for opposite corners, which is how NinjaTrader exports a zone.
+const ANCHORED_RE = new RegExp(`^\\s*(${NUM})\\s*@\\s*(${TS})\\s*${ARROW}\\s*(${NUM})\\s*@\\s*(${TS})(?:\\s+([^()]*?))?\\s*(?:\\(([^)]*)\\))?\\s*$`);
 // Minimal: p1 -> p2  <rest is the label, verbatim>
 const TREND_MIN_RE = new RegExp(`^\\s*(${NUM})\\s*${ARROW}\\s*(${NUM})\\s*(.*)$`);
 
@@ -49,7 +53,9 @@ function parseHeader(line) {
   let before = stripLead(line.slice(0, dm.index)).replace(/[—–\-]\s*$/, '').trim();
   if (!before) return null;
   const first = before.split(/\s+/)[0];
-  if (/^[\d.]+$/.test(first)) return null;            // "15234.50 ..." is a data row, not a header
+  // "15234.50 ..." / "7768.75-7767.50 ..." are data rows, not headers — a dated meta block
+  // ("... (Rectangle, Blue, 2026-09-05 08:00)") otherwise makes them look like one.
+  if (/^[\d.]+(?:\s*-\s*[\d.]+)?$/.test(first)) return null;
   const after = line.slice(dm.index + dm[1].length);
   const tm = after.match(/(\d{2}:\d{2})/);
   return { instrument: before, date: dm[1], time: tm ? tm[1] : null };
@@ -64,13 +70,19 @@ function sectionOf(line) {
 }
 
 const metaParts = str => (str ? str.split(',').map(s => s.trim()) : []);
-const normDateTime = str => (str ? str.trim().slice(0, 16) : null);
-const withYear = (mmddhhmm, year) => (mmddhhmm ? `${year}-${mmddhhmm.trim().replace(/\s+/, ' ')}`.slice(0, 16) : null);
+// Every accepted spelling normalizes to "YYYY-MM-DD HH:MM"; a year-less "MM-DD HH:MM"
+// borrows the year from its block header.
+function normDateTime(str, year) {
+  if (!str) return null;
+  const s = String(str).trim().replace('T', ' ').replace(/\s+/g, ' ');
+  return (/^\d{4}-/.test(s) ? s : `${year}-${s}`).slice(0, 16);
+}
 
 // Parse the data lines of a single block into normalized objects.
 function parseObjects(lines, year) {
   let section = null;
   const objects = [];
+  const skipped = [];   // lines inside a section that matched no shape — surfaced to the importer
   for (const raw of lines) {
     const line = raw.replace(/\s+$/, '');
     if (!line.trim()) continue;
@@ -83,12 +95,23 @@ function parseObjects(lines, year) {
     if (!section) continue;
 
     let m;
-    if (section === 'trends' && (m = line.match(TREND_RICH_RE))) {
+    if (section === 'trends' && (m = line.match(ANCHORED_RE))) {
       const meta = metaParts(m[6]);
       objects.push({
         kind: 'trend', label: (m[5] || '').trim(), type: meta[0] || '', color: meta[1] || DEFAULT_TREND_COLOR,
-        p1: parseFloat(m[1]), at1: withYear(m[2], year),
-        p2: parseFloat(m[3]), at2: withYear(m[4], year),
+        p1: parseFloat(m[1]), at1: normDateTime(m[2], year),
+        p2: parseFloat(m[3]), at2: normDateTime(m[4], year),
+      });
+    } else if (section === 'zones' && (m = line.match(ANCHORED_RE))) {
+      // Opposite corners of a rectangle: the prices give the band, the anchors its span.
+      const meta = metaParts(m[6]);
+      const a = parseFloat(m[1]), b = parseFloat(m[3]);
+      const t1 = normDateTime(m[2], year), t2 = normDateTime(m[4], year);
+      const [from, to] = t1 <= t2 ? [t1, t2] : [t2, t1];
+      objects.push({
+        kind: 'zone', label: (m[5] || '').trim(), type: meta[0] || '', color: meta[1] || DEFAULT_ZONE_COLOR,
+        high: Math.max(a, b), low: Math.min(a, b),
+        at: normDateTime(meta[2], year) || from, at2: to,
       });
     } else if (section === 'trends' && (m = line.match(TREND_MIN_RE))) {
       objects.push({
@@ -100,18 +123,20 @@ function parseObjects(lines, year) {
       const a = parseFloat(m[1]), b = parseFloat(m[2]);
       objects.push({
         kind: 'zone', label: (m[3] || '').trim(), type: meta[0] || '', color: meta[1] || DEFAULT_ZONE_COLOR,
-        high: Math.max(a, b), low: Math.min(a, b), at: normDateTime(meta[2]),
+        high: Math.max(a, b), low: Math.min(a, b), at: normDateTime(meta[2], year), at2: null,
       });
     } else if (section === 'levels' && (m = line.match(LEVEL_RE))) {
       const meta = metaParts(m[3]);
       const type = meta[0] || '';
       objects.push({
         kind: /ray/i.test(type) ? 'ray' : 'line', label: (m[2] || '').trim(), type, color: meta[1] || DEFAULT_LINE_COLOR,
-        price: parseFloat(m[1]), at: normDateTime(meta[2]),
+        price: parseFloat(m[1]), at: normDateTime(meta[2], year),
       });
+    } else {
+      skipped.push(line.trim());
     }
   }
-  return objects;
+  return { objects, skipped };
 }
 
 // Parse one or more instrument blocks. Returns { ok, blocks: [{ instrument, base, date, time, objects, raw }] }.
@@ -132,13 +157,13 @@ function parseLevels(rawText) {
     const blockLines = lines.slice(start, end);
     const hdr = parseHeader(lines[start]);
     const base = hdr.instrument.split(/\s+/)[0].toUpperCase();
-    const objects = parseObjects(blockLines, hdr.date.slice(0, 4));
+    const { objects, skipped } = parseObjects(blockLines, hdr.date.slice(0, 4));
     blocks.push({
       instrument: hdr.instrument, base, date: hdr.date, time: hdr.time,
-      objects, raw: blockLines.join('\n').trim(),
+      objects, skipped, raw: blockLines.join('\n').trim(),
     });
   }
   return { ok: true, blocks };
 }
 
-module.exports = { parseLevels };
+module.exports = { parseLevels, DEFAULT_LINE_COLOR, DEFAULT_ZONE_COLOR, DEFAULT_TREND_COLOR };
