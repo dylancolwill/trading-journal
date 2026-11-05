@@ -1,6 +1,7 @@
 const express = require('express');
 const { pool } = require('../db');
 const { ensureCoverage, readRange, isCovered } = require('../lib/rangecache');
+const { saveExecution } = require('../lib/executionStore');
 const router = express.Router();
 
 const DB_KEY     = process.env.DATABENTO_API_KEY || '';
@@ -215,6 +216,8 @@ router.get('/:tradeId', async (req, res) => {
       return res.json({ cached: false });
     }
     const ticks = await readRange('tick_ranges', w.symbol, w.startMs, w.endMs);
+    // Capture execution metrics while the ticks exist — the cache evicts old ranges.
+    saveExecution(w.trade, ticks).catch(e => console.error('[execution]', e.message));
     res.json(buildResponse(ticks, w.symbol, 0, barSeconds, w.trade));
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -247,6 +250,7 @@ router.post('/:tradeId', async (req, res) => {
     }
     const { cost } = await ensureCoverage('tick_ranges', w.symbol, w.startMs, w.endMs, fetchFn, CACHE_CAP);
     const ticks = await readRange('tick_ranges', w.symbol, w.startMs, w.endMs);
+    saveExecution(w.trade, ticks).catch(e => console.error('[execution]', e.message));
     res.json(buildResponse(ticks, w.symbol, cost, barSeconds, w.trade));
   } catch (err) {
     console.error(err);
@@ -254,4 +258,12 @@ router.post('/:tradeId', async (req, res) => {
   }
 });
 
+// { trade, ticks } when the trade's tick window is already cached, else null. No network.
+async function ticksForTrade(tradeId) {
+  const w = await tradeWindow(tradeId);
+  if (!w || w.err || !(await isCovered('tick_ranges', w.symbol, w.startMs, w.endMs))) return null;
+  return { trade: w.trade, ticks: await readRange('tick_ranges', w.symbol, w.startMs, w.endMs) };
+}
+
 module.exports = router;
+module.exports.ticksForTrade = ticksForTrade;
