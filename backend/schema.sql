@@ -110,3 +110,59 @@ CREATE TABLE IF NOT EXISTS trade_images (
   original_name TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Per-trade AI review output. These columns were added to the live DB by hand before they
+-- were tracked here; the route code has always depended on them.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_analysis TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_score NUMERIC(4,1);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_entry_grade TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_entry_note TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_exit_grade TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_exit_note TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_direction_correct TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS ai_direction_note TEXT;
+
+-- Period performance reviews (the AI Analysis page). One row per generated report, kept as
+-- history so periods can be compared rather than overwritten.
+CREATE TABLE IF NOT EXISTS ai_reports (
+  id SERIAL PRIMARY KEY,
+  period_label TEXT NOT NULL,        -- 'Last 30 days', 'All time', ...
+  period_days INTEGER,               -- NULL = all time
+  from_date DATE,
+  to_date DATE,
+  trade_count INTEGER NOT NULL DEFAULT 0,
+  instrument TEXT DEFAULT '',        -- '' = every instrument
+  report TEXT NOT NULL,
+  top_mistake TEXT,
+  biggest_leak TEXT,
+  first_fix TEXT,
+  trend TEXT,
+  stats JSONB NOT NULL DEFAULT '{}',
+  model TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_reports_created ON ai_reports(created_at DESC);
+
+-- Tick-exact execution metrics per trade (lib/execution.js). Persisted because the tick
+-- cache evicts old ranges: once a trade's ticks are gone these can't be recomputed.
+CREATE TABLE IF NOT EXISTS trade_execution (
+  trade_id INTEGER PRIMARY KEY REFERENCES trades(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  covered BOOLEAN NOT NULL,
+  metrics JSONB NOT NULL DEFAULT '{}',
+  computed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- NY trading session each trade belongs to. A Sydney calendar date can hold two NY sessions
+-- (a 01:00 and a 23:00 trade are different sessions), and one NY session can straddle two
+-- Sydney dates, so session_date — not trade_date — is what levels and session stats key on.
+-- Populated by lib/sessions.js (named-timezone conversion isn't IMMUTABLE, so no generated column).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_date DATE;
+CREATE INDEX IF NOT EXISTS idx_trades_session_date ON trades(session_date);
+
+-- Imported levels belong to a NY session. trade_date is kept only to record the calendar day
+-- the set was imported under.
+ALTER TABLE day_levels ADD COLUMN IF NOT EXISTS session_date DATE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_day_levels_session ON day_levels(session_date, instrument);
+-- Superseded by idx_day_levels_session: two sessions can be imported on one calendar date.
+ALTER TABLE day_levels DROP CONSTRAINT IF EXISTS day_levels_trade_date_instrument_key;

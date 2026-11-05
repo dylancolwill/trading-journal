@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getTrades, deleteTrade, getTags, getLevelDates } from '../api';
+import { getTrades, deleteTrade, getTags, getLevelDates, fetchCandles, fetchTpo, fetchFootprint } from '../api';
 import ImportLevelsModal from './ImportLevelsModal';
 
 const s = {
@@ -77,6 +77,7 @@ export default function TradeList() {
   const [instruments, setInstruments] = useState([]);
   const [collapsedDays, setCollapsedDays] = useState({});
   const [levelsDate, setLevelsDate] = useState(null);
+  const [genState, setGenState] = useState({});
   const [levelDates, setLevelDates] = useState(new Set());
   const navigate = useNavigate();
 
@@ -139,6 +140,31 @@ export default function TradeList() {
   const handleImportLevels = (e, date) => {
     e.stopPropagation();
     setLevelsDate(date);
+  };
+
+  // Pull candles, TPO and footprint for every trade on a day in one go. Each endpoint
+  // only buys the sub-intervals it is missing, so re-running a finished day costs $0.
+  const handleGenerate = async (e, date) => {
+    e.stopPropagation();
+    const dayTrades = byDate[date] || [];
+    if (!dayTrades.length || genState[date]?.running) return;
+    const total = dayTrades.length * 3;
+    let done = 0, cost = 0;
+    const failed = [];
+    setGenState(prev => ({ ...prev, [date]: { running: true, done, total, cost } }));
+    for (const t of dayTrades) {
+      for (const [name, fn] of [['candles', fetchCandles], ['tpo', fetchTpo], ['footprint', fetchFootprint]]) {
+        try {
+          const r = await fn(t.id);
+          cost += Number(r?.cost) || 0;
+        } catch (err) {
+          failed.push(`#${t.id} ${name}`);
+        }
+        done++;
+        setGenState(prev => ({ ...prev, [date]: { running: true, done, total, cost } }));
+      }
+    }
+    setGenState(prev => ({ ...prev, [date]: { running: false, done, total, cost, failed } }));
   };
 
   const tradeRow = (t) => (
@@ -295,12 +321,40 @@ export default function TradeList() {
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end' }}>
                     {(() => {
-                      const hasLevels = levelDates.has(date.slice(0, 10));
+                      // Levels belong to a NY session, and one calendar date can hold two of
+                      // them (a 01:00 and a 23:00 trade are different sessions), so offer a
+                      // button per session rather than one per date.
+                      const sessions = [...new Set(dayTrades.map(t => (t.session_date || t.trade_date || '').slice(0, 10)).filter(Boolean))].sort();
+                      const list = sessions.length ? sessions : [date.slice(0, 10)];
+                      return list.map(sess => {
+                        const hasLevels = levelDates.has(sess);
+                        return (
+                          <button key={sess}
+                            title={`Levels for the ${sess} New York session`}
+                            style={{ ...s.importBtn, ...(hasLevels ? { color: '#22c55e', borderColor: '#22c55e', background: '#22c55e18' } : {}) }}
+                            onClick={e => handleImportLevels(e, sess)}>
+                            {hasLevels ? '✓ Levels' : 'Import levels'}{list.length > 1 ? ` · ${sess.slice(8, 10)}-${sess.slice(5, 7)}` : ''}
+                          </button>
+                        );
+                      });
+                    })()}
+                    {(() => {
+                      const g = genState[date];
+                      const label = g?.running ? `${g.done}/${g.total}…`
+                        : g && g.failed?.length ? `⚠ ${g.failed.length} failed`
+                        : g ? `✓ $${g.cost.toFixed(4)}`
+                        : 'Generate data';
+                      const tone = g?.running ? { color: '#a78bfa', borderColor: '#a78bfa' }
+                        : g && g.failed?.length ? { color: '#f59e0b', borderColor: '#f59e0b', background: '#f59e0b18' }
+                        : g ? { color: '#22c55e', borderColor: '#22c55e', background: '#22c55e18' }
+                        : {};
                       return (
                         <button
-                          style={{ ...s.importBtn, ...(hasLevels ? { color: '#22c55e', borderColor: '#22c55e', background: '#22c55e18' } : {}) }}
-                          onClick={e => handleImportLevels(e, date)}>
-                          {hasLevels ? '✓ Levels' : 'Import levels'}
+                          title={g?.failed?.length ? `Failed: ${g.failed.join(', ')}` : 'Fetch candles, TPO and footprint for every trade this day'}
+                          disabled={!!g?.running}
+                          style={{ ...s.importBtn, ...tone, cursor: g?.running ? 'default' : 'pointer' }}
+                          onClick={e => handleGenerate(e, date)}>
+                          {label}
                         </button>
                       );
                     })()}

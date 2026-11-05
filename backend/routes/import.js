@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const { pool } = require('../db');
 const { parseNTCsv, groupIntoTrades } = require('../lib/groupTrades');
+const { sessionDateOf } = require('../lib/sessions');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -34,12 +35,13 @@ router.post('/', upload.single('file'), async (req, res) => {
     for (const trade of trades) {
       const { rows: [row] } = await client.query(
         `INSERT INTO trades
-          (account, instrument, contract, trade_date, direction, quantity, entry_price, exit_price,
+          (account, instrument, contract, trade_date, session_date, direction, quantity, entry_price, exit_price,
            gross_pnl, commission, net_pnl, open, entry_time, exit_time, source)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'nt_import')
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'nt_import')
          RETURNING id`,
         [
-          trade.account, trade.instrument, trade.contract || trade.instrument, trade.trade_date, trade.direction,
+          trade.account, trade.instrument, trade.contract || trade.instrument, trade.trade_date,
+          sessionDateOf(trade), trade.direction,
           trade.quantity, trade.entry_price, trade.exit_price,
           trade.gross_pnl, trade.commission, trade.net_pnl,
           trade.open, trade.entry_time, trade.exit_time,
@@ -79,6 +81,7 @@ router.post('/preview', upload.single('file'), (req, res) => {
       account: t.account,
       instrument: t.instrument,
       trade_date: t.trade_date,
+      session_date: sessionDateOf(t),
       entry_time: t.entry_time,
       direction: t.direction,
       quantity: t.quantity,
