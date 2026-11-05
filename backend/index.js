@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { initDb } = require('./db');
+const { backfillSessionDates } = require('./lib/sessions');
 
 const tradesRouter = require('./routes/trades');
 const importRouter = require('./routes/import');
@@ -12,6 +13,7 @@ const footprintRouter = require('./routes/footprint');
 const candlesRouter = require('./routes/candles');
 const tpoRouter = require('./routes/tpo');
 const levelsRouter = require('./routes/levels');
+const insightsRouter = require('./routes/insights');
 
 const app = express();
 const PORT = process.env.PORT || 8090;
@@ -27,6 +29,7 @@ app.use('/api/footprint', footprintRouter);
 app.use('/api/candles', candlesRouter);
 app.use('/api/tpo', tpoRouter);
 app.use('/api/levels', levelsRouter);
+app.use('/api/insights', insightsRouter);
 
 const distPath = path.join(__dirname, '../frontend/dist');
 app.use(express.static(distPath));
@@ -36,6 +39,7 @@ app.get('*', (req, res) => {
 
 async function main() {
   await initDb();
+  await backfillSessionDates();
   app.listen(PORT, () => {
     console.log(`Trading Journal running on :${PORT}`);
   });

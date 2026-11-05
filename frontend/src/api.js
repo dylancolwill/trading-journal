@@ -129,8 +129,9 @@ export async function getLevelsForDate(date) {
   return r.json();
 }
 
-export async function saveLevels(raw_text, trade_date) {
-  const r = await fetch(`${BASE}/levels`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ raw_text, trade_date }) });
+// session_date = the NY session these levels belong to (not the calendar day of the export).
+export async function saveLevels(raw_text, session_date) {
+  const r = await fetch(`${BASE}/levels`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ raw_text, session_date }) });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Save failed');
   return r.json();
 }
@@ -141,10 +142,63 @@ export async function deleteLevels(id) {
   return r.json();
 }
 
+// Saved levels back out for re-import elsewhere (NinjaTrader replay, etc.).
+export function levelsExportUrl(date, instrument, format = 'txt') {
+  const q = new URLSearchParams({ date, format });
+  if (instrument) q.set('instrument', instrument);
+  return `${BASE}/levels/export?${q}`;
+}
+
+export async function getLevelsExport(date, instrument, format = 'txt') {
+  const r = await fetch(levelsExportUrl(date, instrument, format));
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
 export async function getLevelsForTrade(tradeId) {
   const r = await fetch(`${BASE}/levels/for-trade/${tradeId}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export async function getInstruments() {
+  const r = await fetch(`${BASE}/trades/meta/instruments`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// --- AI Analysis (period reviews) ---
+
+export async function getInsightsSummary(days = 30, instrument = '') {
+  const q = new URLSearchParams({ days: String(days) });
+  if (instrument) q.set('instrument', instrument);
+  const r = await fetch(`${BASE}/insights/summary?${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getInsightReports(limit = 20) {
+  const r = await fetch(`${BASE}/insights/reports?limit=${limit}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getInsightReport(id) {
+  const r = await fetch(`${BASE}/insights/reports/${id}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function deleteInsightReport(id) {
+  const r = await fetch(`${BASE}/insights/reports/${id}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function insightsAnalyzeUrl(days = 30, instrument = '') {
+  const q = new URLSearchParams({ days: String(days) });
+  if (instrument) q.set('instrument', instrument);
+  return `${BASE}/insights/analyze?${q}`;
 }
 
 export async function importCsv(file, dateFormat = 'au') {
