@@ -12,12 +12,21 @@ plus an AI post-trade analysis.
 - **Footprint chart** — bid × ask per price level, stacked diagonal imbalances, CVD panel, and a
   tick-by-tick replay mode.
 - **TPO / market profile** — Globex-session profile built up to the trade entry, with POC, value
-  area, London initial balance, TPO counts, and a compressed/expanded view toggle.
-- **Imported levels** — paste your marked S/R lines, zones, and trendlines for a session; they
-  render on the candlestick and footprint charts.
-- **AI analysis** — a post-trade review grounded in the orderflow, market profile, and your own
-  levels, written in Dalton's Auction Market Theory framework.
-- **Tags, notes, screenshots, and a P&L dashboard.**
+  area, the RTH initial balance (09:30–10:30 ET), TPO counts, and a compressed/expanded view
+  toggle. The previous session's profile can be overlaid on the same price grid, with a
+  value-area shift readout.
+- **Imported levels** — paste your marked S/R lines, zones (one or two anchors), and trendlines
+  for a session; they render on the candlestick and footprint charts, and export back out as
+  text or CSV. Levels drawn on a full-size contract apply to its micro (ES → MES).
+- **Measured execution** — for every trade, tick-exact facts about what price actually did:
+  normal 1-minute noise, stop size against that noise, 5/15-minute excursions, heat taken before
+  the peak, and whether the directional read was right (decided at 2× noise). Captured while the
+  ticks are cached and stored, since the cache evicts old ranges.
+- **AI analysis** — a per-trade review grounded in the orderflow, market profile, your levels and
+  the measured outcome, plus a period review page: reads-right rate, winner capture, stops vs
+  noise, a stop × target what-if heatmap, and breakdowns by time from the open, side, tag,
+  half-hour ET, weekday and instrument.
+- **Tags, notes, screenshots, and a P&L dashboard** with daily and weekly totals.
 
 ## Stack
 
@@ -32,8 +41,10 @@ plus an AI post-trade analysis.
 ## Layout
 
 ```
-backend/     Express API — routes for trades, import, candles, footprint, tpo, levels, tags, images
-  lib/       CSV parsing, trade grouping, shared market-data range cache
+backend/     Express API — routes for trades, import, candles, footprint, tpo, levels, insights,
+             tags, images
+  lib/       CSV parsing and trade grouping, level parse/format, symbol families, the shared
+             market-data range cache, execution metrics, insight aggregation, NY-session helpers
   schema.sql tables (created automatically on boot)
 frontend/    React app — one page per view under src/pages
 migration/   one-off data migration script
@@ -73,7 +84,13 @@ npm run build          # production build into frontend/dist
 
 ## Notes
 
+- Trades and levels are keyed to the **NY session**, not the local calendar date. Globex rolls at
+  18:00 ET, so one local date routinely holds two sessions — an evening trade belongs to the next
+  one. Anything grouped "by day" groups by session, and a day spanning two sessions gets a levels
+  set per session.
 - Market data is fetched on demand and cached per symbol, so overlapping trade windows reuse
-  what has already been downloaded rather than re-pulling it.
+  what has already been downloaded rather than re-pulling it. The caches are size-capped and
+  evict the oldest ranges, so an old trade's ticks eventually go away — anything derived from
+  them is computed and stored while they are still there.
 - Databento has roughly a one-day lag, so very recent trades may not have data yet.
 - `images/` and `.env` are intentionally untracked.
