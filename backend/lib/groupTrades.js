@@ -44,10 +44,10 @@ function parseDateTime(str) {
     return new Date(y, mo - 1, d, h, mi, s);
   }
 
-  const match = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?/i);
+  const match = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
   if (!match) return null;
 
-  let [, a, b, year, h, min, sec, ampm] = match;
+  let [, a, b, year, h, min, sec = '0', ampm] = match;
   a = parseInt(a); b = parseInt(b); h = parseInt(h);
 
   // If first number > 12 it must be day (d/m/y); else default AU (d/m/y)
@@ -62,7 +62,7 @@ function parseDateTime(str) {
   }
 
   // Local time — no UTC conversion
-  return new Date(parseInt(year), month - 1, day, h, parseInt(min), parseInt(sec));
+  return new Date(parseInt(year), month - 1, day, h, parseInt(min), parseInt(sec || '0'));
 }
 
 function parseMoney(str) {
@@ -112,8 +112,10 @@ function parseNTCsv(content, dateFormat = 'au') {
   }).filter(r => r.instrument && r.account && r.quantity > 0);
 }
 
-// Merge fills that are copy-traded to multiple accounts:
-// fills within 2 seconds sharing instrument + action + price → merged into one
+// Merge fills that are copy-traded to multiple accounts, and partial fills of one order:
+// fills within 2 seconds sharing instrument + action + price + E/X → merged into one.
+// E/X must match: a "Sell 3" closing a long and a "Sell 3" opening a short can land on the
+// same second at the same price, and fusing them loses the first trade's exit entirely.
 function mergeCrossAccountFills(fills, windowMs = 2000) {
   if (!fills || fills.length === 0) return fills;
 
@@ -137,6 +139,7 @@ function mergeCrossAccountFills(fills, windowMs = 2000) {
       if (tB - tA > windowMs) break;
       if (g.instrument === f.instrument &&
           g.action.toLowerCase() === f.action.toLowerCase() &&
+          (g.entryOrExit || '').toLowerCase() === (f.entryOrExit || '').toLowerCase() &&
           Math.abs(g.price - f.price) < 0.000001) {
         group.push(j);
       }
@@ -189,9 +192,15 @@ function groupIntoTrades(fills) {
         trades.push(buildTrade(instrument, currentFills));
         currentFills = [];
       } else if (prevPosition !== 0 && position !== 0 && Math.sign(prevPosition) !== Math.sign(position)) {
-        trades.push(buildTrade(instrument, currentFills.slice(0, -1)));
-        currentFills = [fill];
-        position = delta;
+        // One fill reversed the position — long 3 then selling 5 leaves short 2, not short 5.
+        // Split it in two: the part that closes the old trade (so it isn't left looking like
+        // it never exited) and the part that opens the new one, commission pro-rata.
+        const closeQty = Math.abs(prevPosition);
+        const openQty = Math.abs(position);
+        const part = (qty) => ({ ...fill, quantity: qty, commission: fill.commission * (qty / fill.quantity) });
+        currentFills[currentFills.length - 1] = part(closeQty);
+        trades.push(buildTrade(instrument, currentFills));
+        currentFills = [part(openQty)];
       }
     }
 
@@ -269,4 +278,4 @@ function buildTrade(instrument, fills) {
   };
 }
 
-module.exports = { parseNTCsv, groupIntoTrades, fmtTs };
+module.exports = { parseNTCsv, groupIntoTrades, fmtTs, getPointValue };
