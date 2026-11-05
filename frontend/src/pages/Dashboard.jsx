@@ -64,6 +64,23 @@ export default function Dashboard() {
   const cells = Array(firstDow).fill(null).concat(
     Array.from({ length: daysInMonth }, (_, i) => i + 1)
   );
+  // Pad the tail so the grid always splits into whole 7-day rows, otherwise the last
+  // week's total would land in the wrong column.
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  // One total per calendar row. Days outside this month aren't loaded, so a week that
+  // straddles a month boundary totals only the part shown here.
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) {
+    const days = cells.slice(i, i + 7).filter(Boolean)
+      .map(day => `${year}-${pad(month + 1)}-${pad(day)}`);
+    const traded = days.filter(d => dayPnl[d] !== undefined);
+    weeks.push({
+      pnl: traded.reduce((sum, d) => sum + dayPnl[d], 0),
+      trades: days.reduce((sum, d) => sum + (byDate[d]?.length || 0), 0),
+      days: traded.length,
+    });
+  }
 
   const isToday = (d) => {
     const t = new Date();
@@ -95,48 +112,78 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr) 1.15fr', gap: 6 }}>
           {DAYS.map(d => (
             <div key={d} style={{ textAlign: 'center', fontSize: 11, color: '#52525b', fontWeight: 600, padding: '4px 0', letterSpacing: 0.5 }}>{d}</div>
           ))}
-          {cells.map((day, i) => {
-            if (!day) return <div key={`e${i}`} />;
-            const dateKey = `${year}-${pad(month + 1)}-${pad(day)}`;
-            const pnl = dayPnl[dateKey];
-            const hasTrades = pnl !== undefined;
-            const tradeCount = byDate[dateKey]?.length || 0;
-            const today = isToday(day);
-            const profit = hasTrades && pnl >= 0;
-            const loss = hasTrades && pnl < 0;
+          <div style={{ textAlign: 'center', fontSize: 11, color: '#52525b', fontWeight: 600, padding: '4px 0', letterSpacing: 0.5 }}>Week</div>
+          {weeks.map((w, wi) => (
+            <React.Fragment key={`w${wi}`}>
+              {cells.slice(wi * 7, wi * 7 + 7).map((day, j) => {
+                const i = wi * 7 + j;
+                if (!day) return <div key={`e${i}`} />;
+                const dateKey = `${year}-${pad(month + 1)}-${pad(day)}`;
+              const pnl = dayPnl[dateKey];
+              const hasTrades = pnl !== undefined;
+              const tradeCount = byDate[dateKey]?.length || 0;
+              const today = isToday(day);
+              const profit = hasTrades && pnl >= 0;
+              const loss = hasTrades && pnl < 0;
 
-            return (
-              <div key={dateKey}
-                onClick={() => hasTrades && navigate(`/trades?from=${dateKey}&to=${dateKey}`)}
-                style={{
-                  background: profit ? '#052e16' : loss ? '#1c0a09' : '#09090b',
-                  border: `1px solid ${today ? '#a78bfa' : profit ? '#166534' : loss ? '#7f1d1d' : '#27272a'}`,
-                  borderRadius: 8,
-                  padding: '8px 6px',
-                  textAlign: 'center',
-                  minHeight: 64,
-                  cursor: hasTrades ? 'pointer' : 'default',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  gap: 4,
-                }}>
-                <div style={{ fontSize: 12, color: today ? '#a78bfa' : '#71717a', fontWeight: today ? 700 : 400 }}>{day}</div>
-                {hasTrades && (
+              return (
+                <div key={dateKey}
+                  onClick={() => hasTrades && navigate(`/trades?from=${dateKey}&to=${dateKey}`)}
+                  style={{
+                    background: profit ? '#052e16' : loss ? '#1c0a09' : '#09090b',
+                    border: `1px solid ${today ? '#a78bfa' : profit ? '#166534' : loss ? '#7f1d1d' : '#27272a'}`,
+                    borderRadius: 8,
+                    padding: '8px 6px',
+                    textAlign: 'center',
+                    minHeight: 64,
+                    cursor: hasTrades ? 'pointer' : 'default',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 4,
+                  }}>
+                  <div style={{ fontSize: 12, color: today ? '#a78bfa' : '#71717a', fontWeight: today ? 700 : 400 }}>{day}</div>
+                  {hasTrades && (
+                    <>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: profit ? '#22c55e' : '#ef4444', lineHeight: 1 }}>
+                        {pnl >= 0 ? '+' : ''}${Math.abs(pnl).toFixed(0)}
+                      </div>
+                      <div style={{ fontSize: 10, color: '#52525b' }}>{tradeCount} trade{tradeCount !== 1 ? 's' : ''}</div>
+                    </>
+                  )}
+                </div>
+              );
+              })}
+              <div style={{
+                background: w.days ? (w.pnl >= 0 ? '#052e16' : '#1c0a09') : '#09090b',
+                border: `1px solid ${w.days ? (w.pnl >= 0 ? '#166534' : '#7f1d1d') : '#27272a'}`,
+                borderRadius: 8,
+                padding: '8px 6px',
+                textAlign: 'center',
+                minHeight: 64,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 4,
+              }}>
+                {w.days ? (
                   <>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: profit ? '#22c55e' : '#ef4444', lineHeight: 1 }}>
-                      {pnl >= 0 ? '+' : ''}${Math.abs(pnl).toFixed(0)}
+                    <div style={{ fontSize: 14, fontWeight: 700, color: w.pnl >= 0 ? '#22c55e' : '#ef4444', lineHeight: 1 }}>
+                      {w.pnl >= 0 ? '+' : ''}${Math.abs(w.pnl).toFixed(0)}
                     </div>
-                    <div style={{ fontSize: 10, color: '#52525b' }}>{tradeCount} trade{tradeCount !== 1 ? 's' : ''}</div>
+                    <div style={{ fontSize: 10, color: '#52525b' }}>{w.trades} trade{w.trades !== 1 ? 's' : ''}</div>
                   </>
+                ) : (
+                  <div style={{ fontSize: 12, color: '#3f3f46' }}>—</div>
                 )}
               </div>
-            );
-          })}
+            </React.Fragment>
+          ))}
         </div>
       </div>
     </div>
