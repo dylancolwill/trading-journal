@@ -5,6 +5,7 @@ import Footprint from './Footprint';
 import Candles from './Candles';
 import TPO from './TPO';
 import ReactMarkdown from 'react-markdown';
+import { mdComponents, gradeColor } from '../markdown';
 
 const s = {
   page: { padding: 24, maxWidth: 960, margin: '0 auto' },
@@ -22,13 +23,6 @@ const s = {
   imgGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12, marginTop: 12 },
   imgWrap: { position: 'relative', borderRadius: 8, overflow: 'hidden', border: '1px solid #27272a' },
 };
-
-function gradeColor(g) {
-  if (!g) return '#52525b';
-  if (g === 'good' || g === 'correct') return '#22c55e';
-  if (g === 'ok' || g === 'partial') return '#f59e0b';
-  return '#ef4444'; // poor / incorrect
-}
 
 function gradeLabel(g) {
   if (!g) return '–';
@@ -124,12 +118,11 @@ export default function TradeDetail() {
   };
 
   const STAGES = [
-    [/^\s*(?:##\s*|\*\*)?8[.)]/im, 'Scoring trade…'],
-    [/^\s*(?:##\s*|\*\*)?7[.)]/im, 'Extracting key lesson…'],
-    [/^\s*(?:##\s*|\*\*)?6[.)]/im, 'Reviewing exit timing…'],
-    [/^\s*(?:##\s*|\*\*)?5[.)]/im, 'Finding better entries…'],
-    [/^\s*(?:##\s*|\*\*)?4[.)]/im, 'Verdict: right or wrong…'],
-    [/^\s*(?:##\s*|\*\*)?3[.)]/im, 'Initiative vs responsive…'],
+    [/^\s*(?:##\s*|\*\*)?7[.)]/im, 'Scoring trade…'],
+    [/^\s*(?:##\s*|\*\*)?6[.)]/im, 'Extracting key lesson…'],
+    [/^\s*(?:##\s*|\*\*)?5[.)]/im, 'What went right…'],
+    [/^\s*(?:##\s*|\*\*)?4[.)]/im, 'Risk & management…'],
+    [/^\s*(?:##\s*|\*\*)?3[.)]/im, 'Direction…'],
     [/^\s*(?:##\s*|\*\*)?2[.)]/im, 'Assessing location…'],
     [/^\s*(?:##\s*|\*\*)?1[.)]/im, 'Reading auction context…'],
   ];
@@ -454,23 +447,7 @@ export default function TradeDetail() {
 
         {aiAnalysis ? (
           <div style={{ color: '#e1e1e6', fontSize: 13, lineHeight: 1.7 }}>
-            <ReactMarkdown components={{
-              h1: ({children}) => <div style={{ fontSize: 15, fontWeight: 700, margin: '14px 0 6px', color: '#e1e1e6' }}>{children}</div>,
-              h2: ({children}) => <div style={{ fontSize: 14, fontWeight: 700, margin: '12px 0 5px', color: '#e1e1e6' }}>{children}</div>,
-              h3: ({children}) => <div style={{ fontSize: 13, fontWeight: 700, margin: '10px 0 4px', color: '#a1a1aa' }}>{children}</div>,
-              p: ({children}) => <p style={{ margin: '0 0 8px 0', color: '#d4d4d8' }}>{children}</p>,
-              ul: ({children}) => <ul style={{ margin: '0 0 8px 0', paddingLeft: 18 }}>{children}</ul>,
-              ol: ({children}) => <ol style={{ margin: '0 0 8px 0', paddingLeft: 18 }}>{children}</ol>,
-              li: ({children}) => <li style={{ marginBottom: 3, color: '#d4d4d8' }}>{children}</li>,
-              strong: ({children}) => <strong style={{ color: '#e1e1e6', fontWeight: 600 }}>{children}</strong>,
-              em: ({children}) => <em style={{ color: '#a78bfa' }}>{children}</em>,
-              pre: ({children}) => <pre style={{ margin: '8px 0', background: '#09090b', border: '1px solid #27272a', borderRadius: 6, padding: 12, overflowX: 'auto', fontSize: 11, lineHeight: 1.5 }}>{children}</pre>,
-              code: ({className, children}) => className
-                ? <code style={{ fontFamily: 'monospace', fontSize: 11, color: '#d4d4d8', whiteSpace: 'pre' }}>{children}</code>
-                : <code style={{ background: '#09090b', borderRadius: 4, padding: '1px 5px', fontSize: 12, color: '#a78bfa' }}>{children}</code>,
-              hr: () => <hr style={{ border: 'none', borderTop: '1px solid #27272a', margin: '10px 0' }} />,
-              blockquote: ({children}) => <blockquote style={{ borderLeft: '3px solid #3f3f46', margin: '0 0 8px 0', paddingLeft: 12, color: '#71717a' }}>{children}</blockquote>,
-            }}>
+            <ReactMarkdown components={mdComponents}>
               {aiAnalysis}
             </ReactMarkdown>
             {aiStatus === 'generating' && <span style={{ display: 'inline-block', width: 8, height: 14, background: '#a78bfa', borderRadius: 2, animation: 'blink 1s step-end infinite', verticalAlign: 'text-bottom', marginLeft: 2 }} />}

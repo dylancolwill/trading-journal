@@ -4,6 +4,10 @@ const path = require('path');
 const { pool } = require('../db');
 const { spawn } = require('child_process');
 const { profileForTrade } = require('./tpo');
+const { saveExecution } = require('../lib/executionStore');
+const { executionBlock } = require('../lib/execution');
+const { sameFamily } = require('../lib/symbols');
+const { fmtEt, minutesFromRthOpen } = require('../lib/time');
 const router = express.Router();
 
 const LOCAL_TZ = process.env.TRADE_TZ || 'Australia/Sydney';
@@ -45,6 +49,8 @@ function guessTick(ticks) {
 // Diagonal-imbalance threshold (matches the footprint UI): a side is imbalanced when it is
 // >= this many times the opposing volume one tick across the diagonal.
 const IMBALANCE_RATIO = 2;
+// An imbalance cell whose dominant side is under this share of its bar is flagged minor.
+const MINOR_SHARE = 0.03;
 
 // Per-tick bid × ask breakdown of one bar, windowed ±10 ticks around the reference price(s),
 // with diagonal-imbalance and POC flags. `refs` = [{ price, tag }] to mark entry/exit rows.
@@ -58,6 +64,10 @@ function footprintBlock(bar, tick, refs, title) {
   let pocK = null, pocV = -1;
   for (const k of ks) { const [bd, ak] = bar.levels[k]; if (bd + ak > pocV) { pocV = bd + ak; pocK = k; } }
 
+  // Share of the whole bar's volume, so a single cell can be weighed against the bar it sits
+  // in. An imbalance whose dominant side is under MINOR_SHARE of the bar is marked minor —
+  // technically 2:1, but too small to decide anything.
+  const barVol = ks.reduce((sum, k) => sum + bar.levels[k][0] + bar.levels[k][1], 0) || 1;
   const lines = [];
   for (let k = hiK; k >= loK; k--) {
     const cell = bar.levels[k];
@@ -65,16 +75,20 @@ function footprintBlock(bar, tick, refs, title) {
     const [bid, ask] = cell;
     const bidBelow = (bar.levels[k - 1] || [0, 0])[0];
     const askAbove = (bar.levels[k + 1] || [0, 0])[1];
+    const buyImb = ask > 0 && ask >= IMBALANCE_RATIO * Math.max(bidBelow, 1);
+    const sellImb = bid > 0 && bid >= IMBALANCE_RATIO * Math.max(askAbove, 1);
+    const minor = v => (v / barVol < MINOR_SHARE ? '·minor' : '');
     const flags = [
-      ask > 0 && ask >= IMBALANCE_RATIO * Math.max(bidBelow, 1) ? '>ask' : '',
-      bid > 0 && bid >= IMBALANCE_RATIO * Math.max(askAbove, 1) ? '<bid' : '',
+      buyImb ? '>ask' + minor(ask) : '',
+      sellImb ? '<bid' + minor(bid) : '',
       k === pocK ? 'POC' : '',
       ...refs.filter(r => Math.round(r.price / tick) === k).map(r => r.tag),
     ].filter(Boolean).join(' ');
-    lines.push(`${fmtPx(k * tick).padStart(8)}  ${String(bid).padStart(6)} x ${String(ask).padEnd(6)}${flags ? '  ' + flags : ''}`);
+    const share = `${(((bid + ask) / barVol) * 100).toFixed(1)}%`;
+    lines.push(`${fmtPx(k * tick).padStart(8)}  ${String(bid).padStart(6)} x ${String(ask).padEnd(6)} ${share.padStart(5)}${flags ? '  ' + flags : ''}`);
   }
   if (!lines.length) return '';
-  return `\n\n=== FOOTPRINT DETAIL — ${title} (bid × ask per tick; >ask = buy imbalance, <bid = sell imbalance) ===\n${lines.join('\n')}`;
+  return `\n\n=== FOOTPRINT DETAIL — ${title} (bid × ask per tick; % = that price's share of the bar's ${barVol} contracts; >ask = buy imbalance, <bid = sell imbalance; ·minor = dominant side under ${MINOR_SHARE * 100}% of the bar) ===\n${lines.join('\n')}`;
 }
 
 // META routes must come before /:id to avoid being swallowed by the param
@@ -241,6 +255,7 @@ router.post('/:id/analyze', async (req, res) => {
     console.log(`[analyze] resolved symbol=${symbol}`);
 
     let tickSection = '';
+    let execSection = '';
     if (trade.entry_time) {
       const entryMs = toUtcMs(trade.entry_time);
       const exitMs  = toUtcMs(trade.exit_time) ?? entryMs + 900000;
@@ -344,7 +359,11 @@ router.post('/:id/analyze', async (req, res) => {
           }
         }
 
-        tickSection = `\n\n=== ORDERFLOW DATA (1-min bars, UTC) ===\nTotal ticks: ${allTicks.length}\n\n${lines.join('\n')}${imbSection}${fpSection}`;
+        const cumNote = `Cum Δ accumulates from the first bar shown (${utcHM(sortedBars[0].ts)} UTC, 20 min before entry). It is NOT session cumulative delta.`;
+        tickSection = `\n\n=== ORDERFLOW DATA (1-min bars, UTC) ===\nTotal ticks: ${allTicks.length}\n${cumNote}\n\n${lines.join('\n')}${imbSection}${fpSection}`;
+        // Measured outcome (and persisted, since these ticks will eventually be evicted).
+        try { execSection = executionBlock(await saveExecution(trade, allTicks)); }
+        catch (e) { console.error('[analyze] execution metrics failed:', e.message); }
         console.log(`[analyze] built tick section: ${allTicks.length} ticks, ${sortedBars.length} bars, ${imbLines.length} imbalance runs`);
       }
     }
@@ -362,7 +381,7 @@ router.post('/:id/analyze', async (req, res) => {
         const where = px => px == null ? 'n/a' : [
           px > p.va.high ? 'above VA' : px < p.va.low ? 'below VA' : 'inside VA',
           px > p.poc ? 'above POC' : px < p.poc ? 'below POC' : 'at POC',
-          p.ib ? (px > p.ib.high ? 'above IB' : px < p.ib.low ? 'below IB' : 'inside IB') : null,
+          p.ib ? (px > p.ib.high ? 'above London IB' : px < p.ib.low ? 'below London IB' : 'inside London IB') : null,
         ].filter(Boolean).join(', ');
 
         // Full letter matrix (high -> low). Length of each row = TPO count; the letters are
@@ -380,12 +399,48 @@ router.post('/:id/analyze', async (req, res) => {
           return `${f(r.price).padStart(8)}  ${r.letters}${tags.length ? '  <' + tags.join(',') : ''}`;
         }).join('\n');
 
-        tpoSection = `\n\n=== MARKET PROFILE / TPO (Globex session up to entry; 30-min brackets, A=${openUtc} UTC then +30m each) ===
+        // Prior (completed) Globex session — the reference the current auction opens against.
+        const pp = tpo.prev_profile;
+        let prevBlock = '';
+        if (pp) {
+          const pf = v => Number(v).toFixed(pp.decimals);
+          const pHalf = (pp.row_size || 0) / 2;
+          const pNear = (a, b) => b != null && Math.abs(a - b) < pHalf;
+          const prevOpenUtc = new Date(tpo.prev_session.open).toISOString().slice(11, 16);
+          const prevMatrix = pp.rows.filter(r => r.count > 0).map(r => {
+            const tags = [];
+            if (pNear(r.price, pp.poc)) tags.push('pPOC');
+            if (pNear(r.price, pp.va.high)) tags.push('pVAH');
+            if (pNear(r.price, pp.va.low)) tags.push('pVAL');
+            return `${pf(r.price).padStart(8)}  ${r.letters}${tags.length ? '  <' + tags.join(',') : ''}`;
+          }).join('\n');
+          const vsPrev = px => px == null ? 'n/a'
+            : px > pp.va.high ? 'above prior VA' : px < pp.va.low ? 'below prior VA' : 'inside prior VA';
+          prevBlock = `\n\n=== PREVIOUS SESSION PROFILE (completed Globex session, A=${prevOpenUtc} UTC then +30m each) ===
+${prevMatrix}
+
+Prior POC ${pf(pp.poc)} | Prior value area ${pf(pp.va.high)}–${pf(pp.va.low)} | Prior range ${pf(pp.session_high)}–${pf(pp.session_low)} | Prior TPO ${pp.tpo_over} above POC / ${pp.tpo_under} below
+Today's value vs prior: POC ${f(p.poc)} vs ${pf(pp.poc)} (${p.poc > pp.poc ? 'higher' : p.poc < pp.poc ? 'lower' : 'unchanged'}), VA ${f(p.va.high)}–${f(p.va.low)} vs ${pf(pp.va.high)}–${pf(pp.va.low)} → value ${p.va.low > pp.va.high ? 'higher (accepted above prior VA)' : p.va.high < pp.va.low ? 'lower (accepted below prior VA)' : p.va.high > pp.va.high && p.va.low > pp.va.low ? 'overlapping-to-higher' : p.va.high < pp.va.high && p.va.low < pp.va.low ? 'overlapping-to-lower' : 'overlapping / unchanged'}
+Entry ${entryPx != null ? f(entryPx) : 'n/a'} → ${vsPrev(entryPx)}; Exit ${exitPx != null ? f(exitPx) : 'n/a'} → ${vsPrev(exitPx)}`;
+        }
+
+        // The NY cash session and its Initial Balance — Dalton's IB. The profile's own IB is
+        // the London first hour, an overnight reference only.
+        const r = tpo.rth;
+        const vsRange = (px, hi, lo) => px > hi ? 'above it' : px < lo ? 'below it' : `inside it (${hi - lo > 0 ? Math.round(((px - lo) / (hi - lo)) * 100) : 50}% of the way up)`;
+        const rthLine = !r ? ''
+          : r.status === 'pre-open' ? `RTH (NY cash session): not open yet — entry is ${r.minutes_to_open} min before the 09:30 ET open. Pre-market tape is thin; little structure forms here. There is no RTH Initial Balance yet.`
+          : r.missing ? `RTH (NY cash session): ${r.minutes_in} min in; opening candles not cached, so the RTH range is unknown.`
+          : r.status === 'forming' ? `RTH (NY cash session): opened 09:30 ET at ${fmtPx(r.open_price)}. Initial Balance (09:30–10:30 ET) is still FORMING — ${r.minutes_in} of 60 min in, range so far ${fmtPx(r.high)}–${fmtPx(r.low)}. Entry ${entryPx != null ? fmtPx(entryPx) : 'n/a'} is ${entryPx != null ? vsRange(entryPx, r.high, r.low) : 'n/a'}. Range extension and day type cannot be confirmed until the IB completes.`
+          : `RTH (NY cash session): opened 09:30 ET at ${fmtPx(r.open_price)}. Initial Balance complete ${fmtPx(r.high)}–${fmtPx(r.low)}. Entry ${entryPx != null ? fmtPx(entryPx) : 'n/a'} is ${entryPx != null ? vsRange(entryPx, r.high, r.low) : 'n/a'}.`;
+
+        tpoSection = `\n\n=== MARKET PROFILE / TPO (full Globex session up to entry; 30-min brackets, A=${openUtc} UTC then +30m each) ===
 Letter profile (price high→low; letters = brackets that traded there, so row length = TPO count and letter order = time):
 ${matrix}
 
-POC ${f(p.poc)} | Value area ${f(p.va.high)}–${f(p.va.low)} | London IB ${p.ib ? `${f(p.ib.high)}–${f(p.ib.low)}` : 'not yet formed'} | Session ${f(p.session_high)}–${f(p.session_low)} | TPO ${p.tpo_over} above POC / ${p.tpo_under} below
-Entry ${entryPx != null ? f(entryPx) : 'n/a'} → ${where(entryPx)}; Exit ${exitPx != null ? f(exitPx) : 'n/a'} → ${where(exitPx)}`;
+POC ${f(p.poc)} | Value area ${f(p.va.high)}–${f(p.va.low)} | London IB ${p.ib ? `${f(p.ib.high)}–${f(p.ib.low)}` : 'not yet formed'} (overnight reference only — NOT Dalton's Initial Balance) | Session ${f(p.session_high)}–${f(p.session_low)} | TPO ${p.tpo_over} above POC / ${p.tpo_under} below
+Entry ${entryPx != null ? f(entryPx) : 'n/a'} → ${where(entryPx)}; Exit ${exitPx != null ? f(exitPx) : 'n/a'} → ${where(exitPx)}
+${rthLine}${prevBlock}`;
       }
     } catch (e) { console.error('[analyze] tpo section error:', e.message); }
     console.log(`[analyze] tpoSection populated=${!!tpoSection}`);
@@ -393,13 +448,19 @@ Entry ${entryPx != null ? f(entryPx) : 'n/a'} → ${where(entryPx)}; Exit ${exit
     // --- imported levels for this session (same instrument, nearest day within ±1) ---
     let levelsSection = '';
     try {
-      const base = String(trade.instrument).trim().split(/\s+/)[0].toUpperCase();
-      const { rows: [lv] } = await pool.query(
-        `SELECT levels FROM day_levels
-         WHERE instrument = $2 AND trade_date BETWEEN $1::date - 1 AND $1::date + 1
-         ORDER BY ABS(trade_date - $1::date) LIMIT 1`,
-        [trade.trade_date, base]);
-      const objs = (lv && lv.levels) || [];
+      // The levels for this trade's NY session, same contract family (ES levels apply to an
+      // MES trade — same prices). Exact session match: a Sydney date can hold two sessions.
+      const { rows: lvRows } = await pool.query(
+        'SELECT levels, instrument, session_date FROM day_levels WHERE session_date = $1',
+        [trade.session_date]);
+      const [lv] = lvRows.filter(r => sameFamily(r.instrument, trade.instrument));
+      // Drop objects nowhere near the market — exports have carried phantom drawings at
+      // prices like 1.25 on an ES chart, and they are pure noise to the reviewer.
+      const near = px => entryPx == null || Math.abs(px - entryPx) <= entryPx * 0.1;
+      const all = (lv && lv.levels) || [];
+      const objs = all.filter(o => o.kind === 'zone' ? near(o.high) && near(o.low)
+        : o.kind === 'trend' ? near(o.p1) && near(o.p2) : near(o.price));
+      const dropped = all.length - objs.length;
       if (objs.length) {
         const lines = objs.filter(o => o.kind === 'line' || o.kind === 'ray').map(o => o.price).sort((a, b) => a - b);
         const zones = objs.filter(o => o.kind === 'zone').map(o => `${o.high}–${o.low}`);
@@ -412,7 +473,7 @@ Entry ${entryPx != null ? f(entryPx) : 'n/a'} → ${where(entryPx)}; Exit ${exit
         }
         levelsSection = `\n\n=== TRADER'S MARKED LEVELS (imported for the session) ===
 Horizontal S/R (${lines.length}): ${lines.join(', ') || 'none'}
-Zones (${zones.length}): ${zones.join(', ') || 'none'}${trends.length ? `\nTrendlines (${trends.length}): ${trends.join(' | ')}` : ''}${nearTxt}`;
+Zones (${zones.length}): ${zones.join(', ') || 'none'}${trends.length ? `\nTrendlines (${trends.length}): ${trends.join(' | ')}` : ''}${nearTxt}${dropped ? `\n(${dropped} imported objects far from the market were omitted as export junk.)` : ''}`;
       }
     } catch (e) { console.error('[analyze] levels section error:', e.message); }
     console.log(`[analyze] levelsSection populated=${!!levelsSection}`);
@@ -427,51 +488,62 @@ Zones (${zones.length}): ${zones.join(', ') || 'none'}${trends.length ? `\nTrend
       : durMs < 60000 ? `${Math.round(durMs / 1000)} seconds`
       : `${Math.round(durMs / 60000)} minutes`;
 
-    const prompt = `You are a senior orderflow mentor reviewing one trade from a professional futures scalper's journal, working strictly in James Dalton's Auction Market Theory (Mind Over Markets / Markets in Profile). Judge it on evidence only — the orderflow, market profile, and the trader's own marked levels below. Accuracy over encouragement: if the read was right, say so plainly and cite what confirmed it; if it was wrong, say so plainly and cite what showed it. No hedging, no flattery, no generic advice. Cite specific times, prices, delta values, profile levels, and marked levels.
+    const rthMin = entryUtcMs != null ? minutesFromRthOpen(entryUtcMs) : null;
+    const whenEt = entryUtcMs == null ? ''
+      : ` = ${fmtEt(entryUtcMs)}, ${rthMin >= 0 ? `${rthMin} min after` : `${-rthMin} min before`} the 09:30 ET cash open${rthMin < 0 && rthMin > -24 * 60 ? ' (pre-market)' : ''}`;
 
-## Framework — Dalton AMT (use this vocabulary and logic)
+    const prompt = `You are a senior orderflow mentor reviewing one trade from a futures scalper's journal, using James Dalton's Auction Market Theory (Mind Over Markets / Markets in Profile) as the lens. Give an honest, useful review: what the trader did well, what actually cost them, and the one change that matters most. Accurate, not harsh — the aim is a review a good coach would give, not a list of every imperfection.
+
+## How to weigh evidence (read before anything else)
+- **The OBJECTIVE OUTCOME block is measured tick-by-tick and is ground truth.** Your grades must be consistent with it. If your read of the tape conflicts with it, the measurement wins unless you can name a specific, material reason.
+- **Materiality.** A single footprint cell is not a signal unless it is a large share of its bar (the % column) or part of a stacked run. Cells marked ·minor never decide anything. A move smaller than one normal 1-minute range (given in the objective block) is noise — do not build a verdict on it.
+- **Thin tape** (pre-market, low bar volume) forms little structure. Say so plainly rather than reading an auction into it.
+- **Timeframe.** This is a scalper. Direction is judged on the next several minutes, as measured — not on where the day went later.
+- **Cum Δ** in the table starts at the first bar shown (20 min before entry). It is window delta, not session delta — weigh it as "the last 20 minutes".
+- Cite the specific numbers that carry your point, once each. Do not pad with numbers that don't change the conclusion.
+
+## Framework — Dalton AMT
 - Start with Dalton's two questions: **which way is the market trying to go, and is it doing a good job of it?**
-- The auction exists to facilitate trade. Value = the 70% value area where trade was accepted; POC = the fairest price.
-- **Balance** (rotational, two-sided): responsive trades at the VA edges have edge; the target is rotation back toward POC / opposite edge.
-- **Imbalance / one-timeframe** (range extension, value migrating, trend): fading is the classic error — trade with the other-timeframe (OTF) participant.
-- **Initiative** = buying above value or selling below value (OTF conviction). **Responsive** = buying below value or selling above value (fading back to value).
-- **Excess** (a tail at an extreme) = the auction finished properly; it is the reference responsive trades lean on. **Poor high/low** (flat, no tail) = unfinished business, expect it to be revisited.
-- **Single prints** = aggressive one-timeframe activity; they act as later support/resistance.
-- **IB and range extension**: the Initial Balance frames the early auction; extension beyond it signals OTF entry and argues against fading.
-- **Location is the edge.** Mid-value is the lowest-quality location by construction. The high-quality references are VA edges, POC, IB extremes, single prints, excess tails, and the trader's own marked levels.
+- Value = the 70% value area where trade was accepted; POC = the fairest price.
+- **Balance** (rotational, two-sided): responsive trades at references — VA edges, POC, range extremes, the trader's marked levels — are valid, high-quality plays. The target is rotation toward POC / the opposite edge.
+- **Imbalance / one-timeframe** (range extension, value migrating, sustained initiative flow): trade with the other-timeframe participant. Fading a *confirmed* one-timeframe move is the classic error.
+- **Confirming one-timeframe takes real structure.** A strong 10-minute push is not by itself a trend day. The RTH Initial Balance is the first hour of the NY cash session (09:30–10:30 ET): while it is still forming, do not call range extension or day type with confidence — say what is developing instead.
+- **The profile's "London IB" is an overnight reference only.** Use it as a price level if it matters; never apply Initial Balance / range-extension logic to it.
+- **Initiative** = buying above value or selling below value. **Responsive** = buying below value or selling above value.
+- **Excess** (a tail) = the auction finished properly. **Poor high/low** = unfinished business, likely revisited. **Single prints** act as later support/resistance.
+- **Location is the edge.** Genuine references include POC, VA edges, the forming RTH range extremes, prior-session references, excess, single prints and the trader's own marked levels. "Mid-value" means genuinely away from all of them — not merely inside the value area.
 
 ## This trader — a scalper (day timeframe; holds of seconds to minutes)
-- A short hold is not itself a fault. An entry with no defined reference, or against one-timeframe direction, is.
-- Entry must sit at a specific reference with a definable risk point; mid-value entries are low-edge regardless of how the orderflow looks.
-- Targets should be the next auction reference (POC, opposite VA edge, IB extreme), not open-ended.
-- Cardinal scalping errors: fading initiative/OTF activity, and entering mid-range with no reference.
+- A short hold is not itself a fault.
+- **Stop and target size relative to normal noise is part of the trade — but judge it by the measured direction.** When the direction was measured CORRECT and a stop inside one normal minute's range was tagged before the move, the stop (not the idea) lost the trade — say so, and use the fixed stop/target comparison to show it. When the direction was INCORRECT or PARTIAL, a tight stop that kept the loss small was good risk control, not a fault.
+- Trader's own terms (use exactly): "sell absorption" = buyers absorbing sellers, price holds/reverses up despite sell flow. "buy absorption" = sellers absorbing buyers, price holds/reverses down despite buy flow. "absorption" unqualified = the passive side blocking continuation at a level. Tags follow group/name.
 
-## Trader's own terms (use exactly)
-- "sell absorption" = buyers absorbing sellers; price holds/reverses up despite sell flow.
-- "buy absorption" = sellers absorbing buyers; price holds/reverses down despite buy flow.
-- "absorption" (unqualified) = passive side absorbing the aggressor at a level, blocking continuation.
-- Tags follow group/name.
+## Grading rubric (apply literally)
+- **ENTRY** — *good*: at a genuine reference with material orderflow support, and the heat before the move stayed within about one normal minute's range. *ok*: a reasonable idea with one real weakness (early or late, a weak reference, or heat beyond noise). *poor*: no reference and no material support, or entered straight into confirmed one-timeframe flow. An entry cannot be *poor* when the measured 5-minute excursion is at least 2× in its favour unless you name a material reason it was luck; it cannot be *good* when the measured direction verdict is INCORRECT.
+- **EXIT** — *good*: at or near a logical auction target; or, on a trade whose measured direction was incorrect or partial, a stop that kept the loss small. *ok*: sensible, but left most of the available move or cut on something minor. *poor*: a stop inside normal noise tagged before a measured-CORRECT move (the stop, not the idea, lost the trade), or an exit with no logic.
+- **DIRECTION** — use the measured direction verdict exactly (correct / partial / incorrect). Explain why the tape did what it did; do not override the verdict.
+- **SCORE /10** — weigh location, direction and management roughly equally. 9–10 exceptional; 7–8 good with minor flaws; 5–6 adequate with a real issue; 3–4 weak on two of the three; 0–2 wrong on every measure. A trade whose measured direction is correct and whose entry worked should not score below 5 because of a secondary flaw.
 
 ## Trade
 ${trade.instrument} | ${trade.direction} | Qty ${trade.quantity}
 Entry ${fmtPx(trade.entry_price)} @ ${fmtUtc(entryUtcMs) || '?'} UTC | Exit ${trade.exit_price != null ? fmtPx(trade.exit_price) : 'open'} @ ${fmtUtc(exitUtcMs) || 'N/A'} UTC
 Net P&L ${pnl} | Duration ${duration} | Tags ${tags || 'none'}
+Timing: entry ${fmtUtc(entryUtcMs) ? fmtUtc(entryUtcMs).slice(11, 16) : '?'} UTC${whenEt}
 Notes: ${trade.description || 'none'}
-${tickSection}${tpoSection}${levelsSection}
+${execSection}${tickSection}${tpoSection}${levelsSection}
 
 ## Deliver (concise, evidence-first)
-State each piece of evidence once. A specific fact — a delta value, a price, an imbalance stack, a bar time — is cited in the one section where it is most load-bearing; later sections may refer back to it ("as above", "the same 14:00 stack") but must not re-state it in full. No section restates another section's verdict. Do not repeat the closing summary block in prose. If a section has nothing new to add, keep it to one line.
+Use exactly these numbered sections. State each piece of evidence once; later sections may refer back but must not restate it. If a section has nothing material to add, keep it to one line. No closing recap in prose.
 
-1. **Auction context** — answer Dalton's two questions. Balance or imbalance? Read the TPO letter sequence for value migration and one-timeframe activity. Where did entry sit vs VA / POC / IB, and what did cum delta show into it?
-2. **Developing day type & open** — from the TPO/IB structure to entry, name the developing day type (normal / normal variation / trend / double-distribution / neutral) and which of Dalton's four opens this was (Open-Drive, Open-Test-Drive, Open-Rejection-Reverse, or Open-Auction). One line on what the evidence shows, then one line on how that context supports or undercuts this trade (and what it implies for a better play). Keep it tight — this is a read, not an essay.
-3. **Location** — was entry at a genuine reference (VA edge, POC, IB extreme, single print, excess tail, or one of the trader's marked levels) with a definable risk point, or mid-value with no reference? Did price actually react there per the orderflow (absorption, rejection, break)?
-4. **Right or wrong (initiative vs responsive)** — verdict on the directional read, backed by orderflow + profile + level interaction. Was the trade responsive or initiative, and was that the right choice for the auction state? Fading initiative/OTF activity is the cardinal error — call it out if that is what happened. If right but mismanaged, say that.
-5. **Better entry** — a higher-probability scalp in the window: cite the bar/time, the reference it sat on, and what confirmed it.
-6. **Exit quality** — judged as a scalp: was there a logical auction target (POC / opposite VA edge / IB extreme), and was the exit at it, short of it, or a panic scratch? Do not penalize a short hold by itself, and say so at most once.
-7. **Key lesson** — one specific, actionable lesson, phrased in AMT terms. Do not re-argue the sections above; give the lesson, not a recap.
-8. **Score /10** — location quality, auction read, orderflow confirmation, exit management (9-10 exceptional; 7-8 good, minor flaws; 5-6 adequate w/ issues; 3-4 weak location or against one-timeframe direction; 0-2 fading OTF conviction / no reference / avoidable).
+1. **Auction context** — Dalton's two questions, briefly: balance or developing imbalance, where value sits against the prior session, and where the RTH session stood at entry (pre-market / IB forming / IB complete). Say what is not yet knowable.
+2. **Location & entry** — the reference the entry sat on (or honestly, that there wasn't one), the material orderflow at the entry, and the measured heat before the move.
+3. **Direction** — the measured verdict, and what in the tape explains it. Responsive or initiative, and whether that suited the auction state.
+4. **Risk & management** — stop size against normal noise, exit against the available move (capture), and what the fixed stop/target comparison shows. This is often where the result was decided — give it proper weight.
+5. **What went right** — one or two lines on what the trader did well. If genuinely nothing, say so in one line.
+6. **Key lesson** — the single highest-impact change, concrete and checkable next time. Not a recap.
+7. **Score /10** — one line of justification against the rubric.
 
-End with exactly this block, nothing after. It is the skim-summary — one sentence per note, a verdict pointer only, introducing no evidence not already established above:
+End with exactly this block, nothing after. One sentence per note, introducing nothing not already established above:
 
 ---
 ENTRY: <good|ok|poor> | <one sentence>
@@ -536,11 +608,25 @@ SCORE: <number>/10`;
     // stream-json + partial messages gives real incremental output. In the default text mode
     // the CLI buffers the whole answer and prints it at the end, so the UI sat on one status
     // for minutes and every progress stage fired at once.
+    // Thinking budget. Without --effort the CLI picks its own default and emits no
+    // thinking deltas at all, so the progress readout never leaves the generic stage.
+    // Set ANALYZE_EFFORT to low|medium|high|xhigh|max to trade latency for depth.
+    const effort = process.env.ANALYZE_EFFORT || 'medium';
+    const model = process.env.ANALYZE_MODEL || 'claude-sonnet-5';
+    // effort=none reproduces the original invocation, which passed no --effort at all.
+    const effortArgs = effort === 'none' ? [] : ['--effort', effort];
+    // Do NOT strip the CLI's default system prompt to save input tokens: measured, it
+    // backfires. The ~16k harness prefix is byte-identical across calls and comes back as
+    // cheap cache_read; replacing it makes every call a full-price cache_creation instead
+    // (cached=0), and it stops suppressing extended thinking, adding ~6k output tokens.
+    // Net effect measured on trade 309: $0.21/analysis vs ~$0.06 with the defaults.
     const child = spawn(claudePath, [
-      '-p', '--no-session-persistence', '--model', 'claude-sonnet-4-6',
+      '-p', '--no-session-persistence', '--model', model,
+      ...effortArgs,
       '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
       prompt,
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log(`[analyze] config model=${model} effort=${effort}`);
     console.log(`[analyze] claude spawned pid=${child.pid}`);
 
     child.on('error', err => {
@@ -562,6 +648,11 @@ SCORE: <number>/10`;
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }
 
+        if (ev.type === 'result' && ev.usage) {
+          const u = ev.usage;
+          const inTok = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+          console.log(`[analyze] USAGE in=${inTok} (new=${u.cache_creation_input_tokens || 0} cached=${u.cache_read_input_tokens || 0}) out=${u.output_tokens || 0} think=${(u.output_tokens_details || {}).thinking_tokens || 0} cost=$${(ev.total_cost_usd || 0).toFixed(4)} api=${ev.duration_api_ms}ms`);
+        }
         if (ev.type === 'result' && !fullText && typeof ev.result === 'string') {
           fullText = ev.result;                   // fallback if no deltas were seen
           res.write(`data: ${JSON.stringify({ text: fullText })}\n\n`);

@@ -19,6 +19,7 @@ export default function TPO({ tradeId }) {
   const [err, setErr] = useState('');
   const [collapsed, setCollapsed] = useState(true);
   const [viewMode, setViewMode] = useState('compressed');
+  const [showPrev, setShowPrev] = useState(true);
 
   useEffect(() => {
     let alive = true;
@@ -34,6 +35,7 @@ export default function TPO({ tradeId }) {
   };
 
   const hasData = data && data.cached && data.profile && data.profile.rows && data.profile.rows.length > 0;
+  const hasPrev = hasData && data.prev_profile && data.prev_profile.rows && data.prev_profile.rows.length > 0;
 
   return (
     <div style={{ marginTop: 20 }}>
@@ -50,6 +52,12 @@ export default function TPO({ tradeId }) {
               }}>{m.label}</button>
             ))}
           </div>
+          {hasPrev && (
+            <button onClick={() => setShowPrev(s => !s)} style={{
+              background: showPrev ? '#27272a' : 'transparent', border: '1px solid #27272a', borderRadius: 6,
+              color: showPrev ? '#e1e1e6' : '#52525b', padding: '4px 12px', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+            }}>Prev day</button>
+          )}
           <button onClick={grab} disabled={loading} style={{
             background: '#a78bfa', color: '#1e1b4b', border: 'none', borderRadius: 6,
             padding: '6px 14px', cursor: loading ? 'default' : 'pointer', fontWeight: 600, fontSize: 13, opacity: loading ? 0.6 : 1,
@@ -67,10 +75,19 @@ export default function TPO({ tradeId }) {
           {data && data.cached === false ? 'No data yet — click “Grab data”' : 'Loading…'}
         </div>
       ) : (
-        <Profile data={data} viewMode={viewMode} />
+        <Profile data={data} viewMode={viewMode} showPrev={showPrev && hasPrev} />
       ))}
     </div>
   );
+}
+
+// Where today's developing value sits against the previous session's value area.
+function valueShift(p, pp) {
+  if (p.va.low > pp.va.high) return 'higher';
+  if (p.va.high < pp.va.low) return 'lower';
+  if (p.va.high > pp.va.high && p.va.low > pp.va.low) return 'overlap ↑';
+  if (p.va.high < pp.va.high && p.va.low < pp.va.low) return 'overlap ↓';
+  return 'unchanged';
 }
 
 function Stat({ label, value, color }) {
@@ -82,22 +99,33 @@ function Stat({ label, value, color }) {
   );
 }
 
-function Profile({ data, viewMode = 'compressed' }) {
-  const p = data.profile;
-
-  // Expanded ("split") view keeps every 30-min bracket in its own column, so the letters
-  // show WHEN each price traded. Compressed pushes them left into the classic bell shape.
-  const maxIdx = p.rows.reduce((mx, r) => {
+// Expanded ("split") view keeps every 30-min bracket in its own column, so the letters
+// show WHEN each price traded. Compressed pushes them left into the classic bell shape.
+function makeLettersFor(rows, viewMode) {
+  const maxIdx = rows.reduce((mx, r) => {
     for (const ch of r.letters) mx = Math.max(mx, LETTERS.indexOf(ch));
     return mx;
   }, -1);
-  const lettersFor = (letters) => {
+  return (letters) => {
     if (viewMode !== 'expanded') return letters;
     const set = new Set(letters);
     let out = '';
     for (let i = 0; i <= maxIdx; i++) out += set.has(LETTERS[i]) ? LETTERS[i] : ' ';
     return out;
   };
+}
+
+function Profile({ data, viewMode = 'compressed', showPrev = false }) {
+  const p = data.profile;
+  const pp = showPrev ? data.prev_profile : null;
+
+  const lettersFor = makeLettersFor(p.rows, viewMode);
+  const prevLettersRaw = pp ? makeLettersFor(pp.rows, viewMode) : null;
+  // Yesterday's column grows leftwards towards the price axis, so pad every row out to the
+  // widest one — in a monospace font that right-aligns it without any width guessing.
+  const prevWidth = pp ? pp.rows.reduce((mx, r) => Math.max(mx, prevLettersRaw(r.letters).length), 0) : 0;
+  const prevLettersFor = (letters) => prevLettersRaw(letters).padStart(prevWidth, ' ');
+
   const dec = p.decimals;
   const half = p.row_size / 2;
   const fmtP = v => Number(v).toFixed(dec);
@@ -105,6 +133,15 @@ function Profile({ data, viewMode = 'compressed' }) {
   const near = (price, level) => level != null && Math.abs(price - level) < half;
   const inVA = price => price <= p.va.high + 1e-9 && price >= p.va.low - 1e-9;
   const inIB = price => p.ib && price <= p.ib.high + 1e-9 && price >= p.ib.low - 1e-9;
+  const inPrevVA = price => pp && price <= pp.va.high + 1e-9 && price >= pp.va.low - 1e-9;
+
+  // Both profiles are built on the same row size, so they merge onto one price grid.
+  const kOf = price => Math.round(price / p.row_size);
+  const curByK = new Map(p.rows.map(r => [kOf(r.price), r]));
+  const prevByK = new Map(pp ? pp.rows.map(r => [kOf(r.price), r]) : []);
+  const grid = [...new Set([...curByK.keys(), ...prevByK.keys()])]
+    .sort((a, b) => b - a)                       // high price first
+    .map(k => ({ k, price: k * p.row_size, cur: curByK.get(k), prev: prevByK.get(k) }));
 
   const m = data.markers || {};
   const isShort = m.direction === 'SHORT';
@@ -132,28 +169,68 @@ function Profile({ data, viewMode = 'compressed' }) {
         <Stat label="Open → Entry" value={`${fmtTime(p.session.open, data.display_tz)}–${fmtTime(p.session.close, data.display_tz)}`} />
       </div>
 
+      {/* previous session levels */}
+      {pp && (
+        <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', marginBottom: 12, paddingBottom: 12, borderBottom: '1px solid #1c1c1f' }}>
+          <Stat label="Prev POC" value={fmtP(pp.poc)} color="#94a3b8" />
+          <Stat label="Prev VAH" value={fmtP(pp.va.high)} color="#94a3b8" />
+          <Stat label="Prev VAL" value={fmtP(pp.va.low)} color="#94a3b8" />
+          <Stat label="PDH" value={fmtP(pp.session_high)} color="#94a3b8" />
+          <Stat label="PDL" value={fmtP(pp.session_low)} color="#94a3b8" />
+          <Stat label="Value shift" value={valueShift(p, pp)} color="#94a3b8" />
+        </div>
+      )}
+
+      {/* column headers (only meaningful once yesterday is alongside) */}
+      {pp && (
+        <div style={{ display: 'flex', fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', marginBottom: 4, whiteSpace: 'nowrap' }}>
+          <span style={{ width: 10, flexShrink: 0 }} />
+          {/* same monospace padding trick as the rows, so the label sits over its column */}
+          <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#52525b', letterSpacing: 1, whiteSpace: 'pre', flexShrink: 0 }}>
+            {'Prev session'.slice(0, prevWidth).padStart(prevWidth, ' ')}
+          </span>
+          <span style={{ width: 21, flexShrink: 0 }} />
+          <span style={{ width: 66, flexShrink: 0 }} />
+          <span style={{ width: 34, flexShrink: 0 }} />
+          <span style={{ color: '#52525b' }}>This session</span>
+        </div>
+      )}
+
       {/* profile rows */}
       <div style={{ overflowX: 'auto', fontFamily: 'monospace', fontSize: 12, lineHeight: '15px' }}>
-        {p.rows.map((row, i) => {
-          const isPoc = near(row.price, p.poc);
-          const va = inVA(row.price);
-          const ib = inIB(row.price);
-          const ibHi = near(row.price, p.ib && p.ib.high);
-          const ibLo = near(row.price, p.ib && p.ib.low);
-          const isEntry = near(row.price, m.entry && m.entry.price);
-          const isExit = near(row.price, m.exit && m.exit.price);
+        {grid.map(({ k, price, cur, prev }) => {
+          const row = cur || { price, letters: '', count: 0 };
+          const isPoc = near(price, p.poc);
+          const va = inVA(price);
+          const ib = inIB(price);
+          const ibHi = near(price, p.ib && p.ib.high);
+          const ibLo = near(price, p.ib && p.ib.low);
+          const isEntry = near(price, m.entry && m.entry.price);
+          const isExit = near(price, m.exit && m.exit.price);
+          const isPrevPoc = pp && near(price, pp.poc);
+          const prevVa = inPrevVA(price);
 
           const bg = isPoc ? 'rgba(167,139,250,0.16)' : va ? 'rgba(96,165,250,0.06)' : 'transparent';
           const priceColor = isPoc ? '#a78bfa' : va ? '#93c5fd' : '#71717a';
           const letterColor = isPoc ? '#c4b5fd' : ib ? '#fbbf24' : va ? '#93c5fd' : '#52525b';
+          const prevColor = isPrevPoc ? '#cbd5e1' : prevVa ? '#94a3b8' : '#52525b';
 
           return (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', background: bg, whiteSpace: 'nowrap' }}>
+            <div key={k} style={{ display: 'flex', alignItems: 'center', background: bg, whiteSpace: 'nowrap' }}>
+              {/* previous session, right-aligned so it builds towards the price axis */}
+              {pp && <>
+                <span style={{ width: 10, flexShrink: 0 }} />
+                <span style={{ color: prevColor, letterSpacing: 1, flexShrink: 0, whiteSpace: 'pre',
+                  background: prevVa ? 'rgba(148,163,184,0.07)' : 'transparent' }}>
+                  {prevLettersFor(prev ? prev.letters : '')}
+                </span>
+                <span style={{ width: 1, alignSelf: 'stretch', background: '#27272a', flexShrink: 0, margin: '0 5px' }} />
+              </>}
               {/* IB bracket rail */}
               <span style={{ width: 4, alignSelf: 'stretch', background: ib ? '#f59e0b' : 'transparent', flexShrink: 0, marginRight: 6 }} />
               {/* price */}
               <span style={{ width: 66, textAlign: 'right', color: priceColor, fontWeight: isPoc ? 700 : 400, flexShrink: 0 }}>
-                {fmtP(row.price)}
+                {fmtP(price)}
               </span>
               {/* count */}
               <span style={{ width: 26, textAlign: 'right', color: '#3f3f46', fontSize: 10, flexShrink: 0, marginRight: 8 }}>
@@ -165,8 +242,13 @@ function Profile({ data, viewMode = 'compressed' }) {
               {isPoc && <Tag c="#a78bfa">POC</Tag>}
               {ibHi && <Tag c="#f59e0b">IB H</Tag>}
               {ibLo && <Tag c="#f59e0b">IB L</Tag>}
-              {near(row.price, p.va.high) && <Tag c="#60a5fa">VAH</Tag>}
-              {near(row.price, p.va.low) && <Tag c="#60a5fa">VAL</Tag>}
+              {near(price, p.va.high) && <Tag c="#60a5fa">VAH</Tag>}
+              {near(price, p.va.low) && <Tag c="#60a5fa">VAL</Tag>}
+              {isPrevPoc && <Tag c="#94a3b8">pPOC</Tag>}
+              {pp && near(price, pp.va.high) && <Tag c="#94a3b8">pVAH</Tag>}
+              {pp && near(price, pp.va.low) && <Tag c="#94a3b8">pVAL</Tag>}
+              {pp && near(price, pp.session_high) && <Tag c="#94a3b8">PDH</Tag>}
+              {pp && near(price, pp.session_low) && <Tag c="#94a3b8">PDL</Tag>}
               {isEntry && <Tag c={entryColor}>{entryLabel} entry</Tag>}
               {isExit && <Tag c="#f59e0b">exit</Tag>}
             </div>
@@ -176,6 +258,7 @@ function Profile({ data, viewMode = 'compressed' }) {
 
       <div style={{ fontSize: 11, color: '#52525b', marginTop: 10 }}>
         built from Globex open up to trade entry · each letter = one 30-min bracket · POC = most-traded level · value area = 70% of TPOs · IB = London first hour · TPO count = TPOs above ▲ / below ▼ POC
+        {pp && ' · left column = previous (completed) Globex session on the same price grid; pPOC/pVAH/pVAL/PDH/PDL are its levels'}
       </div>
     </div>
   );

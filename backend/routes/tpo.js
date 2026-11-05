@@ -1,6 +1,7 @@
 const express = require('express');
 const { pool } = require('../db');
 const { ensureCoverage, readRange, isCovered } = require('../lib/rangecache');
+const { nySessionDate, rthOpenMs } = require('../lib/time');
 const router = express.Router();
 
 const DB_KEY    = process.env.DATABENTO_API_KEY || '';
@@ -42,6 +43,17 @@ function shiftDate(dateStr, days) {
   return dt.toISOString().slice(0, 10);
 }
 const pad2 = n => String(n).padStart(2, '0');
+function dowOf(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();   // 0 = Sun … 6 = Sat
+}
+// Open date of the session before the one that opened on `openDate`. Globex runs
+// Sun–Fri, so the day before a Sunday-open session is Saturday (no session) and the
+// real previous session is Thursday's (Thu 17:00 CT -> Fri 16:00 CT).
+function prevSessionOpenDate(openDate) {
+  const back1 = shiftDate(openDate, -1);
+  return dowOf(back1) === 6 ? shiftDate(openDate, -3) : back1;
+}
 
 // London initial-balance window (08:00–09:00 London) that falls inside [openMs, closeMs).
 function londonIB(openMs, closeMs) {
@@ -141,7 +153,8 @@ function niceRowSize(range) {
 
 // Build the market profile from 1-minute candles within [openMs, closeMs].
 // The IB high/low is taken from candles in [ibStartMs, ibEndMs) (London morning).
-function buildProfile(candles, openMs, closeMs, ibStartMs, ibEndMs) {
+// forceRowSize pins the price grid (used so the previous session shares today's rows).
+function buildProfile(candles, openMs, closeMs, ibStartMs, ibEndMs, forceRowSize) {
   const inSession = candles
     .filter(c => c.t >= openMs && c.t < closeMs)
     .sort((a, b) => a.t - b.t);
@@ -149,7 +162,7 @@ function buildProfile(candles, openMs, closeMs, ibStartMs, ibEndMs) {
 
   let hi = -Infinity, lo = Infinity;
   for (const c of inSession) { hi = Math.max(hi, c.h); lo = Math.min(lo, c.l); }
-  const rowSize = niceRowSize(hi - lo);
+  const rowSize = forceRowSize > 0 ? forceRowSize : niceRowSize(hi - lo);
   const decimals = Math.max(0, -Math.floor(Math.log10(rowSize)) );
   const kOf = (price) => Math.round(price / rowSize);
 
@@ -226,8 +239,13 @@ function finalizeProfile(rows, pocIdx, total, target, meta) {
   };
 }
 
-function buildResponse(candles, symbol, cost, w, trade) {
+function buildResponse(candles, symbol, cost, w, trade, prevCandles) {
   const profile = buildProfile(candles, w.openMs, w.closeMs, w.ibStartMs, w.ibEndMs);
+  // Prior session shares today's row size so both profiles sit on the same price grid.
+  const prevProfile = prevCandles
+    ? buildProfile(prevCandles, w.prevOpenMs, w.prevCloseMs, w.prevIbStartMs, w.prevIbEndMs,
+        profile && profile.row_size)
+    : null;
   let markers = null;
   if (trade) {
     markers = {
@@ -244,6 +262,7 @@ function buildResponse(candles, symbol, cost, w, trade) {
     session_tz: GLOBEX_TZ,
     markers,
     profile,
+    prev_profile: prevProfile,
   };
 }
 
@@ -266,8 +285,20 @@ async function tradeWindow(tradeId) {
   // Only build the profile with data available up to when the trade was taken (entry).
   const closeMs = Math.min(sessionCloseMs, entry.getTime());
   const ib = londonIB(openMs, closeMs);
+  // Previous Globex session, i.e. the last completed one before this session opened.
+  // Unlike the current session it is not truncated at entry.
+  const prevOpenDate = prevSessionOpenDate(openDate);
+  const prevOpenMs = wallTimeToUtc(
+    `${prevOpenDate} ${pad2(OPEN_HHMM[0])}:${pad2(OPEN_HHMM[1])}:00`, GLOBEX_TZ).getTime();
+  const prevCloseMs = wallTimeToUtc(
+    `${shiftDate(prevOpenDate, 1)} ${pad2(CLOSE_HHMM[0])}:${pad2(CLOSE_HHMM[1])}:00`, GLOBEX_TZ).getTime();
+  const prevIb = londonIB(prevOpenMs, prevCloseMs);
   const { symbol, stype } = resolveSymbol(trade);
-  return { trade, symbol, stype, openMs, closeMs, ibStartMs: ib && ib.ibStart, ibEndMs: ib && ib.ibEnd };
+  return {
+    trade, symbol, stype,
+    openMs, closeMs, ibStartMs: ib && ib.ibStart, ibEndMs: ib && ib.ibEnd,
+    prevOpenMs, prevCloseMs, prevIbStartMs: prevIb && prevIb.ibStart, prevIbEndMs: prevIb && prevIb.ibEnd,
+  };
 }
 
 // GET: return profile only if the session window is already downloaded.
@@ -279,7 +310,12 @@ router.get('/:tradeId', async (req, res) => {
       return res.json({ cached: false });
     }
     const candles = await readRange('candle_ranges', w.symbol, w.openMs, w.closeMs);
-    res.json(buildResponse(candles, w.symbol, 0, w, w.trade));
+    // The prior session may not be downloaded yet (it was added later than the cache) —
+    // show today's profile regardless and only include yesterday when it's on disk.
+    const prevCandles = (await isCovered('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs))
+      ? await readRange('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs)
+      : null;
+    res.json(buildResponse(candles, w.symbol, 0, w, w.trade, prevCandles));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -299,9 +335,15 @@ router.post('/:tradeId', async (req, res) => {
       });
       return { records: candles, cost };
     };
-    const { cost } = await ensureCoverage('candle_ranges', w.symbol, w.openMs, w.closeMs, fetchFn, CACHE_CAP);
+    // Fetch each session on its own so the dead time between them is never requested:
+    // the daily 16:00–17:00 CT break, and the whole weekend ahead of a Monday session.
+    // Previous session first, so the current one is the newer entry if the cache evicts.
+    const prevCov = await ensureCoverage('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs, fetchFn, CACHE_CAP);
+    const curCov  = await ensureCoverage('candle_ranges', w.symbol, w.openMs, w.closeMs, fetchFn, CACHE_CAP);
+    const cost = prevCov.cost + curCov.cost;
     const candles = await readRange('candle_ranges', w.symbol, w.openMs, w.closeMs);
-    res.json(buildResponse(candles, w.symbol, cost, w, w.trade));
+    const prevCandles = await readRange('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs);
+    res.json(buildResponse(candles, w.symbol, cost, w, w.trade, prevCandles));
   } catch (err) {
     console.error(err);
     res.status(err.status || 500).json({ error: err.message });
@@ -317,7 +359,40 @@ async function profileForTrade(tradeId) {
   if (!candles || !candles.length) return null;
   const profile = buildProfile(candles, w.openMs, w.closeMs, w.ibStartMs, w.ibEndMs);
   if (!profile) return null;
-  return { symbol: w.symbol, display_tz: LOCAL_TZ, session: { open: w.openMs, close: w.closeMs }, profile };
+  // Only hand the model a prior session that is fully downloaded — a partially cached
+  // one would give it a wrong prior high/low/POC to reason from.
+  const prevCandles = (await isCovered('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs))
+    ? await readRange('candle_ranges', w.symbol, w.prevOpenMs, w.prevCloseMs)
+    : null;
+  const prevProfile = (prevCandles && prevCandles.length)
+    ? buildProfile(prevCandles, w.prevOpenMs, w.prevCloseMs, w.prevIbStartMs, w.prevIbEndMs, profile.row_size)
+    : null;
+  return {
+    symbol: w.symbol, display_tz: LOCAL_TZ,
+    session: { open: w.openMs, close: w.closeMs },
+    prev_session: { open: w.prevOpenMs, close: w.prevCloseMs },
+    profile,
+    prev_profile: prevProfile,
+    rth: rthState(candles, w.closeMs),
+  };
+}
+
+// The NY cash-session open and its Initial Balance (09:30–10:30 ET), as of the entry.
+// The profile's own IB is the London first hour, which suits the overnight auction but is
+// not Dalton's IB; the AI reviewer needs the RTH one to judge range extension at the open.
+function rthState(candles, entryMs) {
+  const open = rthOpenMs(nySessionDate(entryMs));
+  const ibEnd = open + 60 * 60000;
+  if (entryMs <= open) return { status: 'pre-open', minutes_to_open: Math.round((open - entryMs) / 60000) };
+  const cs = candles.filter(c => c.t >= open && c.t < Math.min(ibEnd, entryMs)).sort((a, b) => a.t - b.t);
+  if (!cs.length) return { status: entryMs >= ibEnd ? 'complete' : 'forming', minutes_in: Math.round((entryMs - open) / 60000), missing: true };
+  return {
+    status: entryMs >= ibEnd ? 'complete' : 'forming',
+    minutes_in: Math.min(60, Math.round((entryMs - open) / 60000)),
+    open_price: cs[0].o,
+    high: Math.max(...cs.map(c => c.h)),
+    low: Math.min(...cs.map(c => c.l)),
+  };
 }
 
 module.exports = router;
